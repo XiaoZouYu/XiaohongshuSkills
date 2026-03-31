@@ -20,6 +20,7 @@
 - **内容检索与详情读取**：支持搜索笔记并获取指定笔记详情（含评论数据），详情可选滚动加载更多评论/回复
 - **笔记评论**：支持按 `feed_id + xsec_token` 对指定笔记发表一级评论
 - **评论回复**：支持按评论定位条件（评论 ID / 作者 / 文本片段）回复指定评论
+- **评论巡检会话**：支持按批次提取当前可见评论、外部决策后原地回复，再继续下滑处理后续评论
 - **互动动作控制**：支持对指定笔记执行点赞/取消点赞、收藏/取消收藏
 - **用户页信息提取**：支持抓取用户主页快照与主页笔记列表
 - **通知评论抓取**：支持在 `/notification` 页面抓取 `you/mentions` 接口返回
@@ -212,6 +213,49 @@ python scripts/cdp_publish.py get-notification-mentions
 说明：`list-feeds` 返回首页推荐 feed 列表；`search-feeds` 会先在搜索框输入关键词，抓取下拉推荐词（`recommended_keywords`），再回车拉取 feed 列表。
 说明：`get-feed-detail --load-all-comments` 会在详情页滚动评论区，并可选点击“更多回复”后再提取 `window.__INITIAL_STATE__`。
 
+### 5.1 评论巡检会话（适合外部 AI / OpenClaw 编排）
+
+```bash
+# 1) 启动会话，拿到第一批待判断评论
+python scripts/cdp_publish.py comment-session-start \
+    --session-file "/abs/path/comment_session.json" \
+    --feed-id 67abc1234def567890123456 \
+    --xsec-token XSEC_TOKEN \
+    --batch-size 8 \
+    --expand-replies
+
+# 2) 外部系统根据返回的 batch 生成决策 JSON，再推进到下一批
+python scripts/cdp_publish.py comment-session-step \
+    --session-file "/abs/path/comment_session.json" \
+    --decisions-file "/abs/path/comment_decisions.json"
+
+# 3) 全部处理完后关闭会话
+python scripts/cdp_publish.py comment-session-close \
+    --session-file "/abs/path/comment_session.json"
+```
+
+决策 JSON 示例：
+
+```json
+{
+  "decisions": [
+    {
+      "comment_key": "comment:COMMENT_ID_1",
+      "action": "reply",
+      "content": "感谢你的留言，我来补充一下这个问题。"
+    },
+    {
+      "comment_key": "comment:COMMENT_ID_2",
+      "action": "skip"
+    }
+  ]
+}
+```
+
+说明：`comment-session-start` 会返回当前待处理的 `batch`；外部系统只需要对这批评论逐条给出 `reply/skip` 决策即可。
+说明：`comment-session-step` 会先应用当前批次决策；如果有回复失败的评论，它会把失败项留在当前批次，方便你重试或改成 `skip`。
+说明：这套流程仍然基于页面滚动，不是评论接口全量分页抓取，但已经适合“读一批、判断一批、回复一批、继续下滑”的工作流。
+
 ### 6. 获取内容数据表（content_data）
 
 ```bash
@@ -304,6 +348,11 @@ python scripts/cdp_publish.py post-comment-to-feed --feed-id FEED_ID --xsec-toke
 # 回复评论（支持下划线别名：respond_comment）
 python scripts/cdp_publish.py respond-comment --feed-id FEED_ID --xsec-token XSEC_TOKEN --content "回复内容" [--comment-id COMMENT_ID]
 
+# 评论巡检会话（支持下划线别名：comment_session_start / comment_session_step / comment_session_close）
+python scripts/cdp_publish.py comment-session-start --session-file "/abs/path/comment_session.json" --feed-id FEED_ID --xsec-token XSEC_TOKEN --batch-size 8
+python scripts/cdp_publish.py comment-session-step --session-file "/abs/path/comment_session.json" --decisions-file "/abs/path/comment_decisions.json"
+python scripts/cdp_publish.py comment-session-close --session-file "/abs/path/comment_session.json"
+
 # 点赞/取消点赞（支持下划线别名：note_upvote / note_unvote）
 python scripts/cdp_publish.py note-upvote --feed-id FEED_ID --xsec-token XSEC_TOKEN
 python scripts/cdp_publish.py note-unvote --feed-id FEED_ID --xsec-token XSEC_TOKEN
@@ -337,6 +386,7 @@ python scripts/cdp_publish.py switch-account
 说明：`get-login-qrcode` 返回 `qrcode_base64` / `qrcode_data_url`，便于远程前端直接展示扫码。
 说明：`search-feeds` 输出新增 `recommended_keywords_count` 与 `recommended_keywords` 字段，表示输入关键词后回车前的下拉推荐词。
 说明：`get-feed-detail --load-all-comments` 额外返回 `comment_loading`，用于说明评论滚动加载结果。
+说明：`comment-session-start` / `comment-session-step` 会返回 `batch`、`awaiting_decisions`、`completed` 与 `comment_loading` 等字段，方便外部编排系统持续推进评论处理。
 说明：`content-data` 会校验创作者中心登录态，并抓取 `statistics/data-analysis` 页面中的笔记基础信息表。
 
 ### chrome_launcher.py

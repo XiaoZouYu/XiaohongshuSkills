@@ -16,6 +16,9 @@ CLI usage:
     python cdp_publish.py [--host HOST] [--port PORT] get-feed-detail --feed-id FEED_ID --xsec-token TOKEN [--load-all-comments]
     python cdp_publish.py [--host HOST] [--port PORT] post-comment-to-feed --feed-id FEED_ID --xsec-token TOKEN --content "评论内容"
     python cdp_publish.py [--host HOST] [--port PORT] respond-comment --feed-id FEED_ID --xsec-token TOKEN --content "回复内容" [--comment-id ID]
+    python cdp_publish.py [--host HOST] [--port PORT] comment-session-start --session-file FILE --feed-id FEED_ID --xsec-token TOKEN [--batch-size 8]
+    python cdp_publish.py [--host HOST] [--port PORT] comment-session-step --session-file FILE [--decisions-file FILE]
+    python cdp_publish.py [--host HOST] [--port PORT] comment-session-close --session-file FILE
     python cdp_publish.py [--host HOST] [--port PORT] note-upvote --feed-id FEED_ID --xsec-token TOKEN
     python cdp_publish.py [--host HOST] [--port PORT] note-unvote --feed-id FEED_ID --xsec-token TOKEN
     python cdp_publish.py [--host HOST] [--port PORT] note-bookmark --feed-id FEED_ID --xsec-token TOKEN
@@ -46,6 +49,7 @@ Library usage:
     )
 """
 
+import hashlib
 import json
 import os
 import random
@@ -164,6 +168,11 @@ DEFAULT_LOGIN_CACHE_TTL_HOURS = 12.0
 LOGIN_CACHE_FILE = os.path.abspath(
     os.path.join(SCRIPT_DIR, "..", "tmp", "login_status_cache.json")
 )
+COMMENT_REVIEW_SESSION_VERSION = 1
+COMMENT_REVIEW_DEFAULT_BATCH_SIZE = 10
+COMMENT_REVIEW_MAX_BATCH_SIZE = 30
+COMMENT_REVIEW_DEFAULT_SCROLL_ROUNDS = 8
+COMMENT_REVIEW_MAX_SCROLL_ROUNDS = 30
 
 
 def _normalize_timing_jitter(value: float) -> float:
@@ -311,6 +320,152 @@ def _write_content_data_csv(csv_file: str, rows: list[dict[str, Any]]) -> str:
             writer.writerow(row)
 
     return abs_path
+
+
+def _session_timestamp() -> str:
+    """Return an ISO timestamp in Asia/Shanghai timezone."""
+    return datetime.now(ZoneInfo("Asia/Shanghai")).replace(microsecond=0).isoformat()
+
+
+def _normalize_comment_text(value: Any, limit: int = 280) -> str:
+    """Normalize free-form comment text for stable matching and display."""
+    if not isinstance(value, str):
+        return ""
+    normalized = " ".join(value.split()).strip()
+    if limit > 0 and len(normalized) > limit:
+        return normalized[: limit - 1].rstrip() + "…"
+    return normalized
+
+
+def _normalize_comment_batch_size(value: int) -> int:
+    """Clamp comment review batch size to a safe range."""
+    return max(1, min(COMMENT_REVIEW_MAX_BATCH_SIZE, int(value)))
+
+
+def _normalize_comment_scroll_rounds(value: int) -> int:
+    """Clamp per-step comment scroll rounds to a safe range."""
+    return max(1, min(COMMENT_REVIEW_MAX_SCROLL_ROUNDS, int(value)))
+
+
+def _build_comment_key(
+    comment_id: str,
+    author: str,
+    content: str,
+    is_reply: bool,
+    meta_text: str = "",
+) -> str:
+    """Build a stable comment key for session dedupe and decision mapping."""
+    normalized_id = _normalize_comment_text(comment_id, limit=200)
+    if normalized_id:
+        return f"comment:{normalized_id}"
+
+    fingerprint_source = "||".join(
+        [
+            "reply" if is_reply else "parent",
+            _normalize_comment_text(author, limit=120),
+            _normalize_comment_text(content, limit=220),
+            _normalize_comment_text(meta_text, limit=120),
+        ]
+    )
+    digest = hashlib.sha1(fingerprint_source.encode("utf-8")).hexdigest()[:16]
+    return f"fingerprint:{digest}"
+
+
+def _load_comment_review_session(session_file: str) -> dict[str, Any]:
+    """Load comment review session JSON from disk."""
+    abs_path = os.path.abspath(session_file)
+    try:
+        with open(abs_path, "r", encoding="utf-8") as session_handle:
+            payload = json.load(session_handle)
+    except FileNotFoundError as exc:
+        raise CDPError(f"Comment review session file not found: {abs_path}") from exc
+    except json.JSONDecodeError as exc:
+        raise CDPError(f"Failed to parse comment review session JSON: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise CDPError("Comment review session file must contain a JSON object.")
+    if payload.get("session_type") != "comment_review":
+        raise CDPError("Unsupported session file type.")
+    return payload
+
+
+def _save_comment_review_session(session_file: str, payload: dict[str, Any]) -> str:
+    """Persist comment review session JSON and return absolute path."""
+    abs_path = os.path.abspath(session_file)
+    parent = os.path.dirname(abs_path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    payload["updated_at"] = _session_timestamp()
+    with open(abs_path, "w", encoding="utf-8") as session_handle:
+        json.dump(payload, session_handle, ensure_ascii=False, indent=2)
+    return abs_path
+
+
+def _parse_comment_review_decisions(
+    decisions_json: str | None = None,
+    decisions_file: str | None = None,
+) -> list[dict[str, Any]]:
+    """Parse comment review decisions from inline JSON or a JSON file."""
+    if decisions_json and decisions_file:
+        raise CDPError("Provide either --decisions-json or --decisions-file, not both.")
+
+    raw_payload: Any = None
+    if decisions_json:
+        try:
+            raw_payload = json.loads(decisions_json)
+        except json.JSONDecodeError as exc:
+            raise CDPError(f"Failed to parse --decisions-json: {exc}") from exc
+    elif decisions_file:
+        abs_path = os.path.abspath(decisions_file)
+        try:
+            with open(abs_path, "r", encoding="utf-8") as decision_handle:
+                raw_payload = json.load(decision_handle)
+        except FileNotFoundError as exc:
+            raise CDPError(f"Decision file not found: {abs_path}") from exc
+        except json.JSONDecodeError as exc:
+            raise CDPError(f"Failed to parse decision file JSON: {exc}") from exc
+    else:
+        return []
+
+    if isinstance(raw_payload, dict):
+        decisions = raw_payload.get("decisions")
+    else:
+        decisions = raw_payload
+
+    if not isinstance(decisions, list):
+        raise CDPError("Decision payload must be a JSON array or an object with a 'decisions' array.")
+
+    normalized_decisions: list[dict[str, Any]] = []
+    for index, item in enumerate(decisions):
+        if not isinstance(item, dict):
+            raise CDPError(f"Decision #{index + 1} must be a JSON object.")
+
+        comment_key = _normalize_comment_text(item.get("comment_key"), limit=200)
+        comment_id = _normalize_comment_text(item.get("comment_id"), limit=200)
+        action = _normalize_comment_text(item.get("action"), limit=40).lower()
+        content = ""
+        if item.get("content") is not None:
+            content = str(item.get("content")).strip()
+
+        if not comment_key and not comment_id:
+            raise CDPError(f"Decision #{index + 1} is missing comment_key/comment_id.")
+        if action not in {"reply", "skip"}:
+            raise CDPError(
+                f"Decision #{index + 1} has unsupported action '{action}'. "
+                "Use 'reply' or 'skip'."
+            )
+        if action == "reply" and not content:
+            raise CDPError(f"Decision #{index + 1} uses action=reply but content is empty.")
+
+        normalized_decisions.append(
+            {
+                "comment_key": comment_key,
+                "comment_id": comment_id,
+                "action": action,
+                "content": content,
+            }
+        )
+
+    return normalized_decisions
 
 
 class CDPError(Exception):
@@ -2216,6 +2371,506 @@ class XiaohongshuPublisher:
             "notes": best_notes[:safe_limit],
         }
 
+    def _detail_page_prefix(self, feed_id: str) -> str:
+        """Return the note detail URL prefix for a feed id."""
+        return f"https://www.xiaohongshu.com/explore/{feed_id.strip()}"
+
+    def _current_page_url(self) -> str:
+        """Return the current tab URL."""
+        current_url = self._evaluate("window.location.href")
+        return current_url if isinstance(current_url, str) else ""
+
+    def _ensure_feed_detail_page(
+        self,
+        feed_id: str,
+        xsec_token: str,
+        navigate_if_needed: bool = True,
+    ) -> str:
+        """Ensure the current tab is on the target feed detail page."""
+        detail_url = make_feed_detail_url(feed_id, xsec_token)
+        detail_prefix = self._detail_page_prefix(feed_id)
+        current_url = self._current_page_url()
+
+        if not current_url.startswith(detail_prefix):
+            if not navigate_if_needed:
+                raise CDPError("Current tab is not on the target feed detail page.")
+            self._navigate(detail_url)
+            self._sleep(2, minimum_seconds=1.0)
+            current_url = self._current_page_url()
+
+        if isinstance(current_url, str) and "login" in current_url.lower():
+            raise CDPError("Not logged in on xiaohongshu.com. Please log in first.")
+        if self._home_login_prompt_visible(XHS_HOME_LOGIN_MODAL_KEYWORD):
+            raise CDPError("Not logged in on xiaohongshu.com. Please log in first.")
+
+        self._check_feed_page_accessible()
+        return detail_url
+
+    def _scroll_comments_section_into_view(self):
+        """Move the page viewport to the comments area."""
+        self._evaluate(
+            """
+            (() => {
+                const candidates = [
+                    '.comments-container',
+                    '.interaction-container',
+                    '.note-scroller',
+                ];
+                for (const selector of candidates) {
+                    const node = document.querySelector(selector);
+                    if (!(node instanceof HTMLElement)) {
+                        continue;
+                    }
+                    try {
+                        node.scrollIntoView({ behavior: 'instant', block: 'start' });
+                    } catch (error) {}
+                    return true;
+                }
+                window.scrollBy(0, 420);
+                return true;
+            })()
+            """
+        )
+        self._sleep(0.6, minimum_seconds=0.2)
+
+    def get_visible_comment_batch(
+        self,
+        limit: int = COMMENT_REVIEW_DEFAULT_BATCH_SIZE,
+        include_replies: bool = False,
+    ) -> list[dict[str, Any]]:
+        """Extract a visible batch of comment items from the current detail page."""
+        safe_limit = _normalize_comment_batch_size(limit)
+        raw_limit = max(safe_limit * 3, safe_limit)
+        include_replies_literal = "true" if include_replies else "false"
+
+        raw_result = self._evaluate(f"""
+            (() => {{
+                const includeReplies = {include_replies_literal};
+                const limit = {raw_limit};
+                const normalize = (text) => (text || "").replace(/\\s+/g, " ").trim();
+                const visible = (node) => (
+                    node instanceof HTMLElement &&
+                    node.offsetParent !== null &&
+                    node.getBoundingClientRect().width > 18 &&
+                    node.getBoundingClientRect().height > 12
+                );
+                const extractCommentId = (node) => {{
+                    if (!(node instanceof HTMLElement)) {{
+                        return "";
+                    }}
+                    const attrs = [
+                        "data-comment-id",
+                        "data-id",
+                        "comment-id",
+                        "id",
+                    ];
+                    for (const key of attrs) {{
+                        const value = node.getAttribute(key);
+                        if (value && normalize(value)) {{
+                            return normalize(value);
+                        }}
+                    }}
+                    if (node.dataset) {{
+                        const values = [
+                            node.dataset.commentId,
+                            node.dataset.id,
+                            node.dataset.commentid,
+                        ];
+                        for (const value of values) {{
+                            if (value && normalize(value)) {{
+                                return normalize(value);
+                            }}
+                        }}
+                    }}
+                    return "";
+                }};
+                const looksLikeReplyNode = (node) => {{
+                    if (!(node instanceof HTMLElement)) {{
+                        return false;
+                    }}
+                    const ownClassText = normalize(String(node.className || "")).toLowerCase();
+                    if (
+                        ownClassText.includes("reply-item")
+                        || ownClassText.includes("sub-comment")
+                        || ownClassText.includes("child-comment")
+                    ) {{
+                        return true;
+                    }}
+                    if (ownClassText.includes("parent-comment")) {{
+                        return false;
+                    }}
+                    const ancestor = node.parentElement
+                        ? node.parentElement.closest(
+                            "[class*='reply-item'], [class*='sub-comment'], [class*='child-comment'], [class*='reply']"
+                        )
+                        : null;
+                    return !!ancestor;
+                }};
+                const findReplyControl = (container) => {{
+                    const selectors = [
+                        "button",
+                        "[role='button']",
+                        "a",
+                        "span",
+                        "div",
+                    ];
+                    for (const selector of selectors) {{
+                        const nodes = container.querySelectorAll(selector);
+                        for (const node of nodes) {{
+                            if (!visible(node)) {{
+                                continue;
+                            }}
+                            const text = normalize(node.textContent || node.innerText);
+                            if (!text) {{
+                                continue;
+                            }}
+                            if (
+                                text === "回复"
+                                || text.startsWith("回复")
+                                || text === "Reply"
+                                || text.startsWith("Reply")
+                            ) {{
+                                return node;
+                            }}
+                        }}
+                    }}
+                    return null;
+                }};
+                const extractAuthor = (container) => {{
+                    const selectors = [
+                        "[class*='author']",
+                        "[class*='name']",
+                        "[class*='user']",
+                        "a[href*='/user/profile/']",
+                        "a[class*='user']",
+                    ];
+                    for (const selector of selectors) {{
+                        const nodes = container.querySelectorAll(selector);
+                        for (const node of nodes) {{
+                            if (!visible(node)) {{
+                                continue;
+                            }}
+                            const text = normalize(node.textContent || node.innerText);
+                            if (text && text.length <= 80) {{
+                                return text;
+                            }}
+                        }}
+                    }}
+                    return "";
+                }};
+                const extractMetaText = (container, author, content) => {{
+                    const selectors = [
+                        "time",
+                        "[class*='time']",
+                        "[class*='date']",
+                        "[class*='meta']",
+                    ];
+                    for (const selector of selectors) {{
+                        const nodes = container.querySelectorAll(selector);
+                        for (const node of nodes) {{
+                            if (!visible(node)) {{
+                                continue;
+                            }}
+                            const text = normalize(node.textContent || node.innerText);
+                            if (!text) {{
+                                continue;
+                            }}
+                            if (text === author || text === content) {{
+                                continue;
+                            }}
+                            if (text.length <= 80) {{
+                                return text;
+                            }}
+                        }}
+                    }}
+                    return "";
+                }};
+                const removeMatches = (root, selectors) => {{
+                    for (const selector of selectors) {{
+                        const nodes = root.querySelectorAll(selector);
+                        for (const node of nodes) {{
+                            node.remove();
+                        }}
+                    }}
+                }};
+                const extractContent = (container, author) => {{
+                    const directSelectors = [
+                        "[class*='content']",
+                        "[class*='desc']",
+                        "[class*='text']",
+                        "p",
+                        "span",
+                    ];
+                    for (const selector of directSelectors) {{
+                        const nodes = container.querySelectorAll(selector);
+                        for (const node of nodes) {{
+                            if (!visible(node)) {{
+                                continue;
+                            }}
+                            const classText = normalize(String(node.className || "")).toLowerCase();
+                            if (
+                                classText.includes("author")
+                                || classText.includes("name")
+                                || classText.includes("avatar")
+                                || classText.includes("time")
+                                || classText.includes("date")
+                                || classText.includes("action")
+                            ) {{
+                                continue;
+                            }}
+                            const text = normalize(node.textContent || node.innerText);
+                            if (!text || text === author) {{
+                                continue;
+                            }}
+                            if (text.length >= 2) {{
+                                return text;
+                            }}
+                        }}
+                    }}
+
+                    const clone = container.cloneNode(true);
+                    removeMatches(clone, [
+                        "button",
+                        "[role='button']",
+                        "img",
+                        "svg",
+                        "video",
+                        "[class*='avatar']",
+                        "[class*='author']",
+                        "[class*='name']",
+                        "[class*='user']",
+                        "[class*='time']",
+                        "[class*='date']",
+                        "[class*='action']",
+                        "[class*='toolbar']",
+                        "[class*='meta']",
+                    ]);
+                    removeMatches(clone, [
+                        ".reply-item",
+                        "[class*='reply-item']",
+                        ".sub-comment",
+                        "[class*='sub-comment']",
+                        ".child-comment",
+                        "[class*='child-comment']",
+                    ]);
+                    let text = normalize(clone.innerText || clone.textContent || "");
+                    if (author && text.startsWith(author)) {{
+                        text = normalize(text.slice(author.length));
+                    }}
+                    text = text
+                        .replace(/展开\\s*\\d+\\s*条回复/g, " ")
+                        .replace(/查看\\s*\\d+\\s*条回复/g, " ")
+                        .replace(/(?:^|\\s)更多回复(?=\\s|$)/g, " ")
+                        .replace(/(?:^|\\s)回复(?=\\s|$)/g, " ")
+                        .replace(/(?:^|\\s)点赞(?=\\s|$)/g, " ")
+                        .replace(/(?:^|\\s)赞(?=\\s|$)/g, " ");
+                    return normalize(text);
+                }};
+
+                const selectors = [
+                    ".parent-comment",
+                    "[class*='parent-comment']",
+                    ".reply-item",
+                    "[class*='reply-item']",
+                    ".sub-comment",
+                    "[class*='sub-comment']",
+                    ".child-comment",
+                    "[class*='child-comment']",
+                    ".comments-container [class*='comment-item']",
+                    "li[class*='comment']",
+                    "article[class*='comment']",
+                    "div[class*='comment']",
+                ];
+                const root = document.querySelector('.comments-container') || document.body;
+                const seenNodes = new Set();
+                const collected = [];
+
+                for (const selector of selectors) {{
+                    const nodes = root.querySelectorAll(selector);
+                    for (const node of nodes) {{
+                        if (collected.length >= limit) {{
+                            break;
+                        }}
+                        if (!(node instanceof HTMLElement) || seenNodes.has(node)) {{
+                            continue;
+                        }}
+                        seenNodes.add(node);
+                        if (!visible(node)) {{
+                            continue;
+                        }}
+                        const isReply = looksLikeReplyNode(node);
+                        if (isReply && !includeReplies) {{
+                            continue;
+                        }}
+                        const replyControl = findReplyControl(node);
+                        if (!replyControl) {{
+                            continue;
+                        }}
+                        const author = extractAuthor(node);
+                        const content = extractContent(node, author);
+                        if (!content) {{
+                            continue;
+                        }}
+                        const metaText = extractMetaText(node, author, content);
+                        const rect = node.getBoundingClientRect();
+                        collected.push({{
+                            comment_id: extractCommentId(node),
+                            author,
+                            content,
+                            meta_text: metaText,
+                            is_reply: isReply,
+                            rect_top: rect.top,
+                            rect_left: rect.left,
+                        }});
+                    }}
+                    if (collected.length >= limit) {{
+                        break;
+                    }}
+                }}
+
+                collected.sort((left, right) => {{
+                    if (left.rect_top !== right.rect_top) {{
+                        return left.rect_top - right.rect_top;
+                    }}
+                    return left.rect_left - right.rect_left;
+                }});
+                return collected;
+            }})()
+        """)
+
+        if not isinstance(raw_result, list):
+            return []
+
+        comments: list[dict[str, Any]] = []
+        seen_keys: set[str] = set()
+        for item in raw_result:
+            if not isinstance(item, dict):
+                continue
+
+            comment_id = _normalize_comment_text(item.get("comment_id"), limit=200)
+            author = _normalize_comment_text(item.get("author"), limit=120)
+            content = _normalize_comment_text(item.get("content"), limit=280)
+            meta_text = _normalize_comment_text(item.get("meta_text"), limit=120)
+            is_reply = bool(item.get("is_reply"))
+            if not content:
+                continue
+
+            comment_key = _build_comment_key(
+                comment_id=comment_id,
+                author=author,
+                content=content,
+                is_reply=is_reply,
+                meta_text=meta_text,
+            )
+            if comment_key in seen_keys:
+                continue
+            seen_keys.add(comment_key)
+
+            comments.append(
+                {
+                    "comment_key": comment_key,
+                    "comment_id": comment_id,
+                    "author": author,
+                    "content": content,
+                    "meta_text": meta_text,
+                    "text_preview": _normalize_comment_text(content, limit=120),
+                    "is_reply": is_reply,
+                }
+            )
+            if len(comments) >= safe_limit:
+                break
+
+        return comments
+
+    def _click_comment_submit_button(self, description: str = "comment submit button"):
+        """Click the visible submit button for comment/reply input."""
+        submit_rect_js = """
+            (function() {
+                const selectors = [
+                    "div.bottom button.submit",
+                    "div.bottom button[class*='submit']",
+                    "button.submit",
+                    "button[class*='submit']",
+                    "button[type='submit']",
+                ];
+                for (const selector of selectors) {
+                    const el = document.querySelector(selector);
+                    if (!(el instanceof HTMLButtonElement) || el.offsetParent === null) {
+                        continue;
+                    }
+                    if (el.disabled) {
+                        continue;
+                    }
+                    const r = el.getBoundingClientRect();
+                    if (r.width < 8 || r.height < 8) {
+                        continue;
+                    }
+                    return { x: r.x, y: r.y, width: r.width, height: r.height };
+                }
+                const fallbackTexts = new Set(["发送", "提交", "评论", "回复"]);
+                const buttons = document.querySelectorAll("button");
+                for (const button of buttons) {
+                    if (!(button instanceof HTMLButtonElement) || button.offsetParent === null) {
+                        continue;
+                    }
+                    if (button.disabled) {
+                        continue;
+                    }
+                    const text = (button.textContent || "").replace(/\\s+/g, " ").trim();
+                    if (!fallbackTexts.has(text)) {
+                        continue;
+                    }
+                    const r = button.getBoundingClientRect();
+                    if (r.width < 8 || r.height < 8) {
+                        continue;
+                    }
+                    return { x: r.x, y: r.y, width: r.width, height: r.height };
+                }
+                return null;
+            })();
+        """
+        self._click_element_by_cdp(description, submit_rect_js)
+
+    def reply_to_visible_comment(
+        self,
+        content: str,
+        comment_id: str | None = None,
+        comment_author: str | None = None,
+        comment_snippet: str | None = None,
+    ) -> dict[str, Any]:
+        """Reply to a comment already visible on the current detail page."""
+        if not self.ws:
+            raise CDPError("Not connected. Call connect() first.")
+
+        reply_content = content.strip()
+        if not reply_content:
+            raise CDPError("content cannot be empty.")
+
+        target_result = self._activate_reply_target_for_comment(
+            comment_id=comment_id,
+            comment_author=comment_author,
+            comment_snippet=comment_snippet,
+        )
+        if not target_result.get("ok"):
+            raise CDPError(
+                "Failed to locate reply target comment: "
+                f"{target_result.get('reason', 'unknown')}"
+            )
+
+        self._sleep(0.6, minimum_seconds=0.2)
+        filled_len = self._fill_comment_content(reply_content)
+        self._sleep(0.6, minimum_seconds=0.2)
+        self._click_comment_submit_button("comment reply submit button")
+        self._sleep(1.0, minimum_seconds=0.4)
+
+        return {
+            "content_length": filled_len,
+            "matched_comment_id": target_result.get("matched_comment_id", ""),
+            "matched_author": target_result.get("matched_author", ""),
+            "matched_text_preview": target_result.get("matched_text_preview", ""),
+            "success": True,
+        }
+
     def _activate_reply_target_for_comment(
         self,
         comment_id: str | None = None,
@@ -2409,82 +3064,18 @@ class XiaohongshuPublisher:
         if not content:
             raise CDPError("content cannot be empty.")
 
-        detail_url = make_feed_detail_url(feed_id, xsec_token)
-        self._navigate(detail_url)
-        self._sleep(2, minimum_seconds=1.0)
-        self._check_feed_page_accessible()
-
-        target_result = self._activate_reply_target_for_comment(
+        self._ensure_feed_detail_page(feed_id, xsec_token, navigate_if_needed=True)
+        reply_result = self.reply_to_visible_comment(
+            content=content,
             comment_id=comment_id,
             comment_author=comment_author,
             comment_snippet=comment_snippet,
         )
-        if not target_result.get("ok"):
-            raise CDPError(
-                "Failed to locate reply target comment: "
-                f"{target_result.get('reason', 'unknown')}"
-            )
-
-        self._sleep(0.6, minimum_seconds=0.2)
-        filled_len = self._fill_comment_content(content)
-        self._sleep(0.6, minimum_seconds=0.2)
-
-        submit_rect_js = """
-            (function() {
-                const selectors = [
-                    "div.bottom button.submit",
-                    "div.bottom button[class*='submit']",
-                    "button.submit",
-                    "button[class*='submit']",
-                    "button[type='submit']",
-                ];
-                for (const selector of selectors) {
-                    const el = document.querySelector(selector);
-                    if (!(el instanceof HTMLButtonElement) || el.offsetParent === null) {
-                        continue;
-                    }
-                    if (el.disabled) {
-                        continue;
-                    }
-                    const r = el.getBoundingClientRect();
-                    if (r.width < 8 || r.height < 8) {
-                        continue;
-                    }
-                    return { x: r.x, y: r.y, width: r.width, height: r.height };
-                }
-                const fallbackTexts = new Set(["发送", "提交", "评论", "回复"]);
-                const buttons = document.querySelectorAll("button");
-                for (const button of buttons) {
-                    if (!(button instanceof HTMLButtonElement) || button.offsetParent === null) {
-                        continue;
-                    }
-                    if (button.disabled) {
-                        continue;
-                    }
-                    const text = (button.textContent || "").replace(/\\s+/g, " ").trim();
-                    if (!fallbackTexts.has(text)) {
-                        continue;
-                    }
-                    const r = button.getBoundingClientRect();
-                    if (r.width < 8 || r.height < 8) {
-                        continue;
-                    }
-                    return { x: r.x, y: r.y, width: r.width, height: r.height };
-                }
-                return null;
-            })();
-        """
-        self._click_element_by_cdp("comment reply submit button", submit_rect_js)
-        self._sleep(1.0, minimum_seconds=0.4)
 
         return {
             "feed_id": feed_id,
             "xsec_token": xsec_token,
-            "content_length": filled_len,
-            "matched_comment_id": target_result.get("matched_comment_id", ""),
-            "matched_author": target_result.get("matched_author", ""),
-            "matched_text_preview": target_result.get("matched_text_preview", ""),
-            "success": True,
+            **reply_result,
         }
 
     def _set_note_toggle_state(
@@ -2612,10 +3203,7 @@ class XiaohongshuPublisher:
         if not xsec_token:
             raise CDPError("xsec_token cannot be empty.")
 
-        detail_url = make_feed_detail_url(feed_id, xsec_token)
-        self._navigate(detail_url)
-        self._sleep(2, minimum_seconds=1.0)
-        self._check_feed_page_accessible()
+        self._ensure_feed_detail_page(feed_id, xsec_token, navigate_if_needed=True)
 
         result = self._set_note_toggle_state(
             selectors=[
@@ -2883,52 +3471,7 @@ class XiaohongshuPublisher:
         filled_len = self._fill_comment_content(content)
         self._sleep(0.6, minimum_seconds=0.2)
 
-        submit_rect_js = """
-            (function() {
-                const selectors = [
-                    "div.bottom button.submit",
-                    "div.bottom button[class*='submit']",
-                    "button.submit",
-                    "button[class*='submit']",
-                    "button[type='submit']",
-                ];
-                for (const selector of selectors) {
-                    const el = document.querySelector(selector);
-                    if (!(el instanceof HTMLButtonElement) || el.offsetParent === null) {
-                        continue;
-                    }
-                    if (el.disabled) {
-                        continue;
-                    }
-                    const r = el.getBoundingClientRect();
-                    if (r.width < 8 || r.height < 8) {
-                        continue;
-                    }
-                    return { x: r.x, y: r.y, width: r.width, height: r.height };
-                }
-                const fallbackTexts = new Set(["发送", "提交", "评论"]);
-                const buttons = document.querySelectorAll("button");
-                for (const button of buttons) {
-                    if (!(button instanceof HTMLButtonElement) || button.offsetParent === null) {
-                        continue;
-                    }
-                    if (button.disabled) {
-                        continue;
-                    }
-                    const text = (button.textContent || "").replace(/\\s+/g, " ").trim();
-                    if (!fallbackTexts.has(text)) {
-                        continue;
-                    }
-                    const r = button.getBoundingClientRect();
-                    if (r.width < 8 || r.height < 8) {
-                        continue;
-                    }
-                    return { x: r.x, y: r.y, width: r.width, height: r.height };
-                }
-                return null;
-            })();
-        """
-        self._click_element_by_cdp("comment submit button", submit_rect_js)
+        self._click_comment_submit_button("comment submit button")
         self._sleep(1.0, minimum_seconds=0.4)
 
         print(f"[cdp_publish] Comment posted. feed_id={feed_id}, length={filled_len}")
@@ -4048,6 +4591,492 @@ class XiaohongshuPublisher:
         )
 
 
+def _filter_unprocessed_comment_batch(
+    batch: list[dict[str, Any]],
+    processed_keys: set[str],
+    batch_size: int,
+) -> list[dict[str, Any]]:
+    """Return the next undecided comment batch in original order."""
+    filtered: list[dict[str, Any]] = []
+    for item in batch:
+        if not isinstance(item, dict):
+            continue
+        comment_key = _normalize_comment_text(item.get("comment_key"), limit=200)
+        if not comment_key or comment_key in processed_keys:
+            continue
+        filtered.append(item)
+        if len(filtered) >= batch_size:
+            break
+    return filtered
+
+
+def _collect_comment_review_batch(
+    publisher: XiaohongshuPublisher,
+    session_payload: dict[str, Any],
+) -> dict[str, Any]:
+    """Collect the next undecided visible comment batch from the current page."""
+    processed_keys = {
+        _normalize_comment_text(item, limit=200)
+        for item in session_payload.get("processed_comment_keys", [])
+        if isinstance(item, str) and _normalize_comment_text(item, limit=200)
+    }
+    batch_size = _normalize_comment_batch_size(
+        int(session_payload.get("batch_size", COMMENT_REVIEW_DEFAULT_BATCH_SIZE))
+    )
+    include_replies = bool(session_payload.get("include_replies", False))
+    expand_replies = bool(session_payload.get("expand_replies", False))
+    reply_limit = max(0, int(session_payload.get("reply_limit", 10) or 0))
+    scroll_speed = str(session_payload.get("scroll_speed", "normal") or "normal")
+    max_scroll_rounds = _normalize_comment_scroll_rounds(
+        int(session_payload.get("max_scroll_rounds", COMMENT_REVIEW_DEFAULT_SCROLL_ROUNDS))
+    )
+
+    publisher._scroll_comments_section_into_view()
+    clicked_total = 0
+    skipped_total = 0
+
+    def extract_batch() -> list[dict[str, Any]]:
+        raw_batch = publisher.get_visible_comment_batch(
+            limit=batch_size,
+            include_replies=include_replies,
+        )
+        return _filter_unprocessed_comment_batch(
+            batch=raw_batch,
+            processed_keys=processed_keys,
+            batch_size=batch_size,
+        )
+
+    if expand_replies:
+        click_result = publisher._click_more_reply_buttons(reply_limit=reply_limit)
+        clicked_total += int(click_result.get("clicked", 0) or 0)
+        skipped_total += int(click_result.get("skipped", 0) or 0)
+        if int(click_result.get("clicked", 0) or 0) > 0:
+            publisher._sleep(0.8, minimum_seconds=0.25)
+
+    initial_state = publisher._extract_feed_comments_state()
+    batch = extract_batch()
+    if batch:
+        current_state = publisher._extract_feed_comments_state()
+        return {
+            "batch": batch,
+            "comment_loading": {
+                "total_comments": int(current_state.get("total_comments", 0) or 0),
+                "loaded_parent_comments": int(current_state.get("parent_comment_count", 0) or 0),
+                "scroll_rounds": 0,
+                "clicked_more_replies": clicked_total,
+                "skipped_more_replies": skipped_total,
+                "end_detected": bool(current_state.get("end_detected")),
+                "no_comments": bool(current_state.get("no_comments")),
+                "scroll_speed": scroll_speed,
+            },
+            "end_detected": bool(current_state.get("end_detected")),
+        }
+
+    state = initial_state
+    rounds = 0
+    while rounds < max_scroll_rounds and not bool(state.get("end_detected")):
+        if expand_replies:
+            click_result = publisher._click_more_reply_buttons(reply_limit=reply_limit)
+            clicked_total += int(click_result.get("clicked", 0) or 0)
+            skipped_total += int(click_result.get("skipped", 0) or 0)
+            if int(click_result.get("clicked", 0) or 0) > 0:
+                publisher._sleep(0.8, minimum_seconds=0.25)
+                batch = extract_batch()
+                if batch:
+                    state = publisher._extract_feed_comments_state()
+                    break
+
+        rounds += 1
+        publisher._scroll_feed_comments_area(
+            speed=scroll_speed,
+            large_mode=rounds >= 4,
+            push_count=3 if rounds >= 4 else 1,
+        )
+        state = publisher._extract_feed_comments_state()
+        batch = extract_batch()
+        if batch:
+            break
+
+    final_state = publisher._extract_feed_comments_state()
+    return {
+        "batch": batch,
+        "comment_loading": {
+            "total_comments": int(final_state.get("total_comments", 0) or 0),
+            "loaded_parent_comments": int(final_state.get("parent_comment_count", 0) or 0),
+            "scroll_rounds": rounds,
+            "clicked_more_replies": clicked_total,
+            "skipped_more_replies": skipped_total,
+            "end_detected": bool(final_state.get("end_detected")),
+            "no_comments": bool(final_state.get("no_comments")),
+            "scroll_speed": scroll_speed,
+        },
+        "end_detected": bool(final_state.get("end_detected")),
+    }
+
+
+def _restore_comment_review_context(
+    publisher: XiaohongshuPublisher,
+    session_payload: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Best-effort restore of the detail page context before applying a pending batch."""
+    current_batch = session_payload.get("current_batch", [])
+    if not isinstance(current_batch, list) or not current_batch:
+        return None
+
+    last_loading = session_payload.get("last_comment_loading")
+    if not isinstance(last_loading, dict):
+        return None
+
+    target_limit = max(
+        _normalize_comment_batch_size(
+            int(session_payload.get("batch_size", COMMENT_REVIEW_DEFAULT_BATCH_SIZE))
+        ),
+        int(last_loading.get("loaded_parent_comments", 0) or 0),
+    )
+    if target_limit <= 0:
+        return None
+
+    return publisher._load_feed_detail_comments(
+        limit=target_limit,
+        click_more_replies=bool(session_payload.get("expand_replies", False)),
+        reply_limit=max(0, int(session_payload.get("reply_limit", 10) or 0)),
+        scroll_speed=str(session_payload.get("scroll_speed", "normal") or "normal"),
+    )
+
+
+def _apply_comment_review_decisions(
+    publisher: XiaohongshuPublisher,
+    session_payload: dict[str, Any],
+    decisions: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Apply decisions to the current comment batch and update session state."""
+    current_batch = session_payload.get("current_batch", [])
+    if not isinstance(current_batch, list):
+        current_batch = []
+
+    if not current_batch:
+        if decisions:
+            raise CDPError("Current session has no pending batch to apply decisions to.")
+        return {
+            "applied_decisions": [],
+            "failed_decisions": [],
+            "pending_batch": [],
+            "replied_count": 0,
+            "skipped_count": 0,
+        }
+
+    if not decisions:
+        raise CDPError(
+            "Current session batch still has pending comments. "
+            "Please provide --decisions-json or --decisions-file."
+        )
+
+    batch_by_key: dict[str, dict[str, Any]] = {}
+    batch_by_comment_id: dict[str, dict[str, Any]] = {}
+    for item in current_batch:
+        if not isinstance(item, dict):
+            continue
+        comment_key = _normalize_comment_text(item.get("comment_key"), limit=200)
+        comment_id = _normalize_comment_text(item.get("comment_id"), limit=200)
+        if comment_key:
+            batch_by_key[comment_key] = item
+        if comment_id:
+            batch_by_comment_id[comment_id] = item
+
+    decision_by_key: dict[str, dict[str, Any]] = {}
+    for decision in decisions:
+        comment_key = _normalize_comment_text(decision.get("comment_key"), limit=200)
+        comment_id = _normalize_comment_text(decision.get("comment_id"), limit=200)
+
+        target = None
+        if comment_key:
+            target = batch_by_key.get(comment_key)
+        if target is None and comment_id:
+            target = batch_by_comment_id.get(comment_id)
+        if target is None:
+            raise CDPError(
+                "Decision target is not part of the current batch: "
+                f"{comment_key or comment_id or '<unknown>'}"
+            )
+
+        resolved_key = _normalize_comment_text(target.get("comment_key"), limit=200)
+        if resolved_key in decision_by_key:
+            raise CDPError(f"Duplicate decision provided for comment '{resolved_key}'.")
+        decision_by_key[resolved_key] = decision
+
+    missing_keys = [
+        _normalize_comment_text(item.get("comment_key"), limit=200)
+        for item in current_batch
+        if isinstance(item, dict)
+        and _normalize_comment_text(item.get("comment_key"), limit=200)
+        and _normalize_comment_text(item.get("comment_key"), limit=200) not in decision_by_key
+    ]
+    if missing_keys:
+        raise CDPError(
+            "Some comments in the current batch are still undecided: "
+            + ", ".join(missing_keys[:5])
+        )
+
+    processed_keys = {
+        _normalize_comment_text(item, limit=200)
+        for item in session_payload.get("processed_comment_keys", [])
+        if isinstance(item, str) and _normalize_comment_text(item, limit=200)
+    }
+    replied_keys = {
+        _normalize_comment_text(item, limit=200)
+        for item in session_payload.get("replied_comment_keys", [])
+        if isinstance(item, str) and _normalize_comment_text(item, limit=200)
+    }
+
+    applied_decisions: list[dict[str, Any]] = []
+    failed_decisions: list[dict[str, Any]] = []
+    pending_batch: list[dict[str, Any]] = []
+    replied_count = 0
+    skipped_count = 0
+
+    for item in current_batch:
+        if not isinstance(item, dict):
+            continue
+
+        comment_key = _normalize_comment_text(item.get("comment_key"), limit=200)
+        if not comment_key:
+            continue
+        decision = decision_by_key[comment_key]
+        action = decision.get("action")
+
+        if action == "skip":
+            processed_keys.add(comment_key)
+            skipped_count += 1
+            applied_decisions.append(
+                {
+                    "comment_key": comment_key,
+                    "comment_id": item.get("comment_id", ""),
+                    "action": "skip",
+                    "success": True,
+                }
+            )
+            continue
+
+        try:
+            reply_result = publisher.reply_to_visible_comment(
+                content=str(decision.get("content") or ""),
+                comment_id=_normalize_comment_text(item.get("comment_id"), limit=200) or None,
+                comment_author=_normalize_comment_text(item.get("author"), limit=120) or None,
+                comment_snippet=_normalize_comment_text(item.get("text_preview"), limit=120) or None,
+            )
+        except CDPError as exc:
+            pending_batch.append(item)
+            failure_payload = {
+                "comment_key": comment_key,
+                "comment_id": item.get("comment_id", ""),
+                "action": "reply",
+                "success": False,
+                "error": str(exc),
+            }
+            applied_decisions.append(failure_payload)
+            failed_decisions.append(failure_payload)
+            continue
+
+        processed_keys.add(comment_key)
+        replied_keys.add(comment_key)
+        replied_count += 1
+        applied_decisions.append(
+            {
+                "comment_key": comment_key,
+                "comment_id": item.get("comment_id", ""),
+                "action": "reply",
+                "success": True,
+                "matched_comment_id": reply_result.get("matched_comment_id", ""),
+                "matched_author": reply_result.get("matched_author", ""),
+                "matched_text_preview": reply_result.get("matched_text_preview", ""),
+            }
+        )
+
+    session_payload["processed_comment_keys"] = sorted(processed_keys)
+    session_payload["replied_comment_keys"] = sorted(replied_keys)
+    session_payload["current_batch"] = pending_batch
+
+    return {
+        "applied_decisions": applied_decisions,
+        "failed_decisions": failed_decisions,
+        "pending_batch": pending_batch,
+        "replied_count": replied_count,
+        "skipped_count": skipped_count,
+    }
+
+
+def _start_comment_review_session(
+    publisher: XiaohongshuPublisher,
+    session_file: str,
+    feed_id: str,
+    xsec_token: str,
+    include_replies: bool,
+    expand_replies: bool,
+    reply_limit: int,
+    scroll_speed: str,
+    batch_size: int,
+    max_scroll_rounds: int,
+) -> dict[str, Any]:
+    """Create a fresh comment review session and return the first batch."""
+    normalized_feed_id = feed_id.strip()
+    normalized_xsec_token = xsec_token.strip()
+    session_payload = {
+        "version": COMMENT_REVIEW_SESSION_VERSION,
+        "session_type": "comment_review",
+        "feed_id": normalized_feed_id,
+        "xsec_token": normalized_xsec_token,
+        "detail_url": make_feed_detail_url(normalized_feed_id, normalized_xsec_token),
+        "include_replies": bool(include_replies),
+        "expand_replies": bool(expand_replies),
+        "reply_limit": max(0, int(reply_limit)),
+        "scroll_speed": (scroll_speed or "normal").strip().lower(),
+        "batch_size": _normalize_comment_batch_size(batch_size),
+        "max_scroll_rounds": _normalize_comment_scroll_rounds(max_scroll_rounds),
+        "processed_comment_keys": [],
+        "replied_comment_keys": [],
+        "current_batch": [],
+        "started_at": _session_timestamp(),
+        "updated_at": _session_timestamp(),
+        "end_detected": False,
+        "last_comment_loading": None,
+    }
+
+    publisher._ensure_feed_detail_page(
+        normalized_feed_id,
+        normalized_xsec_token,
+        navigate_if_needed=True,
+    )
+    batch_result = _collect_comment_review_batch(publisher, session_payload)
+    session_payload["current_batch"] = batch_result["batch"]
+    session_payload["end_detected"] = bool(batch_result["end_detected"]) and not bool(batch_result["batch"])
+    session_payload["last_comment_loading"] = batch_result["comment_loading"]
+
+    abs_session_file = _save_comment_review_session(session_file, session_payload)
+    current_batch = session_payload["current_batch"]
+    return {
+        "session_file": abs_session_file,
+        "feed_id": normalized_feed_id,
+        "xsec_token": normalized_xsec_token,
+        "batch_count": len(current_batch),
+        "batch": current_batch,
+        "processed_total": len(session_payload["processed_comment_keys"]),
+        "replied_total": len(session_payload["replied_comment_keys"]),
+        "end_detected": bool(session_payload["end_detected"]),
+        "completed": bool(session_payload["end_detected"]) and not bool(current_batch),
+        "awaiting_decisions": bool(current_batch),
+        "comment_loading": session_payload["last_comment_loading"],
+    }
+
+
+def _step_comment_review_session(
+    publisher: XiaohongshuPublisher,
+    session_file: str,
+    decisions: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Apply decisions for the current batch and advance to the next batch."""
+    session_payload = _load_comment_review_session(session_file)
+    current_batch = session_payload.get("current_batch", [])
+    if not isinstance(current_batch, list):
+        current_batch = []
+        session_payload["current_batch"] = current_batch
+
+    feed_id = _normalize_comment_text(session_payload.get("feed_id"), limit=200)
+    xsec_token = _normalize_comment_text(session_payload.get("xsec_token"), limit=300)
+    if not feed_id or not xsec_token:
+        raise CDPError("Session file is missing feed_id or xsec_token.")
+
+    publisher._ensure_feed_detail_page(
+        feed_id,
+        xsec_token,
+        navigate_if_needed=True,
+    )
+    restore_result = _restore_comment_review_context(
+        publisher=publisher,
+        session_payload=session_payload,
+    )
+    if restore_result is not None:
+        session_payload["last_restore_loading"] = restore_result
+
+    apply_result = _apply_comment_review_decisions(
+        publisher=publisher,
+        session_payload=session_payload,
+        decisions=decisions,
+    )
+    session_payload["last_apply_result"] = {
+        "applied_count": len(apply_result["applied_decisions"]),
+        "failed_count": len(apply_result["failed_decisions"]),
+        "replied_count": int(apply_result["replied_count"]),
+        "skipped_count": int(apply_result["skipped_count"]),
+    }
+
+    advanced = False
+    if session_payload["current_batch"]:
+        session_payload["end_detected"] = False
+        abs_session_file = _save_comment_review_session(session_file, session_payload)
+        pending_batch = session_payload["current_batch"]
+        return {
+            "session_file": abs_session_file,
+            "feed_id": feed_id,
+            "xsec_token": xsec_token,
+            "advanced": advanced,
+            "batch_count": len(pending_batch),
+            "batch": pending_batch,
+            "processed_total": len(session_payload.get("processed_comment_keys", [])),
+            "replied_total": len(session_payload.get("replied_comment_keys", [])),
+            "awaiting_decisions": True,
+            "end_detected": False,
+            "completed": False,
+            "applied_decisions": apply_result["applied_decisions"],
+            "failed_decisions": apply_result["failed_decisions"],
+            "comment_loading": session_payload.get("last_comment_loading"),
+        }
+
+    batch_result = _collect_comment_review_batch(publisher, session_payload)
+    session_payload["current_batch"] = batch_result["batch"]
+    session_payload["last_comment_loading"] = batch_result["comment_loading"]
+    session_payload["end_detected"] = bool(batch_result["end_detected"]) and not bool(batch_result["batch"])
+    advanced = True
+
+    abs_session_file = _save_comment_review_session(session_file, session_payload)
+    next_batch = session_payload["current_batch"]
+    return {
+        "session_file": abs_session_file,
+        "feed_id": feed_id,
+        "xsec_token": xsec_token,
+        "advanced": advanced,
+        "batch_count": len(next_batch),
+        "batch": next_batch,
+        "processed_total": len(session_payload.get("processed_comment_keys", [])),
+        "replied_total": len(session_payload.get("replied_comment_keys", [])),
+        "awaiting_decisions": bool(next_batch),
+        "end_detected": bool(session_payload["end_detected"]),
+        "completed": bool(session_payload["end_detected"]) and not bool(next_batch),
+        "applied_decisions": apply_result["applied_decisions"],
+        "failed_decisions": apply_result["failed_decisions"],
+        "comment_loading": session_payload["last_comment_loading"],
+    }
+
+
+def _close_comment_review_session(session_file: str) -> dict[str, Any]:
+    """Delete a comment review session file and return the final summary."""
+    session_payload = _load_comment_review_session(session_file)
+    abs_session_file = os.path.abspath(session_file)
+    if os.path.exists(abs_session_file):
+        os.remove(abs_session_file)
+    return {
+        "session_file": abs_session_file,
+        "feed_id": _normalize_comment_text(session_payload.get("feed_id"), limit=200),
+        "xsec_token": _normalize_comment_text(session_payload.get("xsec_token"), limit=300),
+        "processed_total": len(session_payload.get("processed_comment_keys", [])),
+        "replied_total": len(session_payload.get("replied_comment_keys", [])),
+        "remaining_batch_count": len(session_payload.get("current_batch", []))
+        if isinstance(session_payload.get("current_batch"), list)
+        else 0,
+        "started_at": session_payload.get("started_at"),
+        "updated_at": session_payload.get("updated_at"),
+    }
+
+
 # ---------------------------------------------------------------------------
 # CLI entry point
 # ---------------------------------------------------------------------------
@@ -4221,6 +5250,72 @@ def main():
     p_reply.add_argument("--comment-id", help="Target comment id")
     p_reply.add_argument("--comment-author", help="Target comment author name (fuzzy match)")
     p_reply.add_argument("--comment-snippet", help="Target comment text snippet (fuzzy match)")
+
+    # comment-session-* - iterative comment review workflow for external AI orchestration
+    p_comment_session_start = sub.add_parser(
+        "comment-session-start",
+        aliases=["comment_session_start"],
+        help="Start a comment review session and return the first undecided batch",
+    )
+    p_comment_session_start.add_argument("--session-file", required=True, help="JSON session file path")
+    p_comment_session_start.add_argument("--feed-id", required=True, help="Feed id")
+    p_comment_session_start.add_argument("--xsec-token", required=True, help="xsec token")
+    p_comment_session_start.add_argument(
+        "--include-replies",
+        action="store_true",
+        help="Include visible reply comments in the batch",
+    )
+    p_comment_session_start.add_argument(
+        "--expand-replies",
+        action="store_true",
+        help="Try to expand visible reply groups while collecting batches",
+    )
+    p_comment_session_start.add_argument(
+        "--reply-limit",
+        type=int,
+        default=10,
+        help="Skip expanding reply groups above this size when possible (default: 10)",
+    )
+    p_comment_session_start.add_argument(
+        "--scroll-speed",
+        choices=("slow", "normal", "fast"),
+        default="normal",
+        help="Comment review scroll speed (default: normal)",
+    )
+    p_comment_session_start.add_argument(
+        "--batch-size",
+        type=int,
+        default=COMMENT_REVIEW_DEFAULT_BATCH_SIZE,
+        help=f"Visible comments per batch (default: {COMMENT_REVIEW_DEFAULT_BATCH_SIZE})",
+    )
+    p_comment_session_start.add_argument(
+        "--max-scroll-rounds",
+        type=int,
+        default=COMMENT_REVIEW_DEFAULT_SCROLL_ROUNDS,
+        help=f"Max scroll rounds while seeking a new batch (default: {COMMENT_REVIEW_DEFAULT_SCROLL_ROUNDS})",
+    )
+
+    p_comment_session_step = sub.add_parser(
+        "comment-session-step",
+        aliases=["comment_session_step"],
+        help="Apply current batch decisions, then continue to the next undecided batch",
+    )
+    p_comment_session_step.add_argument("--session-file", required=True, help="JSON session file path")
+    p_comment_session_step.add_argument(
+        "--decisions-json",
+        help="Inline JSON decisions payload for the current batch",
+    )
+    p_comment_session_step.add_argument(
+        "--decisions-file",
+        help="Path to a JSON file containing decisions for the current batch",
+    )
+
+    p_comment_session_close = sub.add_parser(
+        "comment-session-close",
+        aliases=["comment_session_close"],
+        help="Close a comment review session and remove its session file",
+    )
+    p_comment_session_close.add_argument("--session-file", required=True, help="JSON session file path")
 
     # profile-snapshot - read user profile summary
     p_profile = sub.add_parser(
@@ -4413,6 +5508,12 @@ def main():
             sys.exit(1)
         return
 
+    elif args.command in ("comment-session-close", "comment_session_close"):
+        payload = _close_comment_review_session(args.session_file)
+        print("COMMENT_SESSION_CLOSE_RESULT:")
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return
+
     # Commands that require Chrome - login/re-login/switch-account always headed
     if args.command in ("login", "re-login", "switch-account"):
         headless = False
@@ -4588,6 +5689,52 @@ def main():
                 comment_snippet=args.comment_snippet,
             )
             print("RESPOND_COMMENT_RESULT:")
+            print(json.dumps(payload, ensure_ascii=False, indent=2))
+
+        elif args.command in ("comment-session-start", "comment_session_start"):
+            publisher.connect(
+                target_url_prefix=f"https://www.xiaohongshu.com/explore/{args.feed_id.strip()}",
+                reuse_existing_tab=False,
+            )
+            if not publisher.check_home_login():
+                print("NOT_LOGGED_IN")
+                sys.exit(1)
+
+            payload = _start_comment_review_session(
+                publisher=publisher,
+                session_file=args.session_file,
+                feed_id=args.feed_id,
+                xsec_token=args.xsec_token,
+                include_replies=args.include_replies,
+                expand_replies=args.expand_replies,
+                reply_limit=args.reply_limit,
+                scroll_speed=args.scroll_speed,
+                batch_size=args.batch_size,
+                max_scroll_rounds=args.max_scroll_rounds,
+            )
+            print("COMMENT_SESSION_START_RESULT:")
+            print(json.dumps(payload, ensure_ascii=False, indent=2))
+
+        elif args.command in ("comment-session-step", "comment_session_step"):
+            session_payload = _load_comment_review_session(args.session_file)
+            feed_id = _normalize_comment_text(session_payload.get("feed_id"), limit=200)
+            if not feed_id:
+                raise CDPError("Session file is missing feed_id.")
+
+            decisions = _parse_comment_review_decisions(
+                decisions_json=args.decisions_json,
+                decisions_file=args.decisions_file,
+            )
+            publisher.connect(
+                target_url_prefix=f"https://www.xiaohongshu.com/explore/{feed_id}",
+                reuse_existing_tab=False,
+            )
+            payload = _step_comment_review_session(
+                publisher=publisher,
+                session_file=args.session_file,
+                decisions=decisions,
+            )
+            print("COMMENT_SESSION_STEP_RESULT:")
             print(json.dumps(payload, ensure_ascii=False, indent=2))
 
         elif args.command in ("profile-snapshot", "profile_snapshot"):

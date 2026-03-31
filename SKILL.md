@@ -2,7 +2,7 @@
 name: RedBookSkills
 description: |
   将图文/视频内容自动发布到小红书（XHS），并支持登录检查、内容检索与互动操作。
-  适用场景：发布图文、发布视频、仅启动测试浏览器、获取登录二维码、首页推荐抓取、搜索笔记、评论互动、抓取内容数据。
+  适用场景：发布图文、发布视频、仅启动测试浏览器、获取登录二维码、首页推荐抓取、搜索笔记、评论互动、评论巡检会话、抓取内容数据。
 metadata:
   trigger: 发布内容到小红书
   source: Angiin/Post-to-xhs
@@ -16,7 +16,7 @@ metadata:
 
 优先按以下顺序判断：
 1. 用户明确要求"测试浏览器 / 启动浏览器 / 检查登录 / 获取登录二维码 / 只打开不发布"：进入测试浏览器流程。
-2. 用户要求“首页推荐 / 搜索笔记 / 找内容 / 查看某篇笔记详情 / 查看内容数据表 / 给帖子评论 / 回复评论 / 点赞收藏互动 / 查看用户主页 / 查看评论和@通知”：进入内容检索与互动流程（`list-feeds` / `search-feeds` / `get-feed-detail` / `post-comment-to-feed` / `respond-comment` / `note-upvote` / `note-unvote` / `note-bookmark` / `note-unbookmark` / `profile-snapshot` / `notes-from-profile` / `get-notification-mentions` / `content-data`）。
+2. 用户要求“首页推荐 / 搜索笔记 / 找内容 / 查看某篇笔记详情 / 查看内容数据表 / 给帖子评论 / 回复评论 / 批量巡检评论 / 分批读取评论后继续回复 / 点赞收藏互动 / 查看用户主页 / 查看评论和@通知”：进入内容检索与互动流程（`list-feeds` / `search-feeds` / `get-feed-detail` / `post-comment-to-feed` / `respond-comment` / `comment-session-start` / `comment-session-step` / `comment-session-close` / `note-upvote` / `note-unvote` / `note-bookmark` / `note-unbookmark` / `profile-snapshot` / `notes-from-profile` / `get-notification-mentions` / `content-data`）。
 3. 用户已提供 `标题 + 正文 + 视频(本地路径或 URL)`：直接进入视频发布流程。
 4. 用户已提供 `标题 + 正文 + 图片(本地路径或 URL)`：直接进入图文发布流程。
 5. 用户只提供网页 URL：先提取网页内容与图片/视频，再给出可发布草稿，等待用户确认。
@@ -62,11 +62,12 @@ metadata:
 4. 若用户需要详情，从搜索结果中取 `id` + `xsecToken` 再执行 `get-feed-detail`；如用户明确要更多评论，可加 `--load-all-comments` 等参数。
 5. 若用户需要发表评论，执行 `post-comment-to-feed`（一级评论；必填 `feed_id` / `xsec_token` / `content`）。
 6. 若用户需要回复某条评论，执行 `respond-comment`（可用 `comment_id` / `comment_author` / `comment_snippet` 定位目标评论）。
-7. 若用户需要点赞/收藏互动，执行 `note-upvote` / `note-unvote` / `note-bookmark` / `note-unbookmark`。
-8. 若用户需要用户主页信息，执行 `profile-snapshot` 或 `notes-from-profile`。
-9. 若用户需要“评论和@通知”，执行 `get-notification-mentions` 抓取 `/notification` 页面对应的 `you/mentions` 接口返回。
-10. 若用户需要“笔记基础信息表”，执行 `content-data` 获取曝光/观看/点赞等指标。
-11. 回传结构化结果（数量、核心字段、链接）。
+7. 若用户需要“读取一批评论 -> 外部决策 -> 原地回复 -> 继续往下滑”的连续工作流，优先使用 `comment-session-start` / `comment-session-step` / `comment-session-close`。`start` 负责拿首批评论，`step` 负责应用当前批次决策并推进到下一批，`close` 负责收尾。
+8. 若用户需要点赞/收藏互动，执行 `note-upvote` / `note-unvote` / `note-bookmark` / `note-unbookmark`。
+9. 若用户需要用户主页信息，执行 `profile-snapshot` 或 `notes-from-profile`。
+10. 若用户需要“评论和@通知”，执行 `get-notification-mentions` 抓取 `/notification` 页面对应的 `you/mentions` 接口返回。
+11. 若用户需要“笔记基础信息表”，执行 `content-data` 获取曝光/观看/点赞等指标。
+12. 回传结构化结果（数量、核心字段、链接）。
 
 ## 常用命令
 
@@ -234,6 +235,7 @@ python scripts/cdp_publish.py get-feed-detail \
 说明：`list-feeds` 返回首页推荐 feed 列表。
 说明：`search-feeds` 输出中包含 `recommended_keywords_count` 与 `recommended_keywords`，表示回车前搜索框下拉推荐词。
 说明：`get-feed-detail --load-all-comments` 会先滚动评论区，并可选点击“更多回复”后再提取详情，同时额外返回 `comment_loading`。
+说明：需要“分批读评论并持续推进”时，不要重复调用 `get-feed-detail` 轮询，优先改用 `comment-session-start` / `comment-session-step`。
 说明：`check-login` 与主页登录检查默认启用本地缓存（12h，仅缓存“已登录”），到期后自动重新网页校验。
 
 ### 6) 给笔记发表评论（一级评论）
@@ -298,6 +300,47 @@ python scripts/cdp_publish.py profile-snapshot --user-id USER_ID
 python scripts/cdp_publish.py notes-from-profile --user-id USER_ID --limit 20 --max-scrolls 3
 ```
 
+### 9.5) 评论巡检会话（适合外部 AI / OpenClaw 编排）
+
+```bash
+# 启动会话，拿到首批待判断评论
+python scripts/cdp_publish.py comment-session-start \
+  --session-file "/abs/path/comment_session.json" \
+  --feed-id 67abc1234def567890123456 \
+  --xsec-token XSEC_TOKEN \
+  --batch-size 8 \
+  --expand-replies
+
+# 对当前 batch 生成决策 JSON 后，推进到下一批
+python scripts/cdp_publish.py comment-session-step \
+  --session-file "/abs/path/comment_session.json" \
+  --decisions-file "/abs/path/comment_decisions.json"
+
+# 全部处理完后关闭会话
+python scripts/cdp_publish.py comment-session-close \
+  --session-file "/abs/path/comment_session.json"
+```
+
+决策 JSON 结构：
+
+```json
+{
+  "decisions": [
+    {
+      "comment_key": "comment:COMMENT_ID_1",
+      "action": "reply",
+      "content": "感谢你的留言，这里我补充一下。"
+    },
+    {
+      "comment_key": "comment:COMMENT_ID_2",
+      "action": "skip"
+    }
+  ]
+}
+```
+
+说明：`comment-session-step` 只有在“当前批次全部有决策”时才会推进到下一批；如果某条评论回复失败，失败项会留在当前批次，方便重试或改成 `skip`。
+
 补充：更完整的背景说明、安装说明与面向人工阅读的示例可参考 `README.md`，但本文件中的命令样例应优先作为 agent 执行基线。
 
 ## 失败处理
@@ -306,4 +349,5 @@ python scripts/cdp_publish.py notes-from-profile --user-id USER_ID --limit 20 --
 - 图片/视频下载失败：提示更换 URL 或改用本地文件。
 - 本地路径不可用：优先改用绝对路径；若为 WSL/远程 CDP 的 Windows/UNC 路径，可先尝试 `--skip-file-check`，必要时再加 `--preserve-upload-paths`。
 - 评论/回复目标未定位成功：提示补充 `comment_id`，或改用 `comment_author` / `comment_snippet` 再试。
+- 评论巡检会话中断：优先保留原有 `session-file` 并重试；若当前详情页已丢失且批次仍未处理完，再提示用户重新启动会话。
 - 页面选择器失效：提示检查 `scripts/cdp_publish.py` 中选择器并更新。
