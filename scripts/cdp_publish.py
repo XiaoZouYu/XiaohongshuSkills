@@ -7,10 +7,12 @@ publishing articles on Xiaohongshu (RED) creator center.
 CLI usage:
     # Basic commands
     python cdp_publish.py [--host HOST] [--port PORT] check-login [--headless] [--account NAME] [--reuse-existing-tab] [--preserve-upload-paths]
+    python cdp_publish.py [--host HOST] [--port PORT] check-home-login [--headless] [--account NAME] [--reuse-existing-tab]
     python cdp_publish.py [--host HOST] [--port PORT] fill --title "标题" --content "正文" --images img1.jpg [--headless] [--account NAME] [--reuse-existing-tab] [--preserve-upload-paths]
     python cdp_publish.py [--host HOST] [--port PORT] publish --title "标题" --content "正文" --images img1.jpg [--headless] [--account NAME] [--reuse-existing-tab] [--preserve-upload-paths]
     python cdp_publish.py [--host HOST] [--port PORT] click-publish [--headless] [--account NAME] [--reuse-existing-tab] [--preserve-upload-paths]
     python cdp_publish.py [--host HOST] [--port PORT] get-login-qrcode [--wait-seconds 20]
+    python cdp_publish.py [--host HOST] [--port PORT] get-home-login-qrcode [--wait-seconds 20]
     python cdp_publish.py [--host HOST] [--port PORT] list-feeds
     python cdp_publish.py [--host HOST] [--port PORT] search-feeds --keyword "关键词" [--sort-by 综合|最新|最多点赞|最多评论|最多收藏]
     python cdp_publish.py [--host HOST] [--port PORT] get-feed-detail --feed-id FEED_ID --xsec-token TOKEN [--load-all-comments]
@@ -29,7 +31,8 @@ CLI usage:
     python cdp_publish.py [--host HOST] [--port PORT] content-data [--page-num 1] [--page-size 10] [--type 0]
 
     # Account management
-    python cdp_publish.py [--host HOST] [--port PORT] login [--account NAME]           # open browser for QR login
+    python cdp_publish.py [--host HOST] [--port PORT] login [--account NAME]           # open creator login page for QR login
+    python cdp_publish.py [--host HOST] [--port PORT] home-login [--account NAME]      # open xiaohongshu.com login modal for QR login
     python cdp_publish.py [--host HOST] [--port PORT] re-login [--account NAME]        # clear cookies and re-login same account
     python cdp_publish.py [--host HOST] [--port PORT] switch-account [--account NAME]  # clear cookies + open login for new account
     python cdp_publish.py [--host HOST] [--port PORT] list-accounts                    # list all configured accounts
@@ -1088,10 +1091,43 @@ class XiaohongshuPublisher:
         """)
         return bool(visible)
 
+    def _probe_home_login_state(
+        self,
+        keyword: str = XHS_HOME_LOGIN_MODAL_KEYWORD,
+        wait_seconds: float = 8.0,
+    ) -> dict[str, Any]:
+        """Probe current xiaohongshu.com login state without consulting cache."""
+        current_url = self._evaluate("window.location.href")
+        print(f"[cdp_publish] Home URL: {current_url}")
+        if isinstance(current_url, str) and "login" in current_url.lower():
+            return {
+                "required": True,
+                "reason": "login_url",
+                "current_url": current_url,
+            }
+
+        deadline = time.time() + max(0.0, wait_seconds)
+        while time.time() < deadline:
+            if self._home_login_prompt_visible(keyword):
+                return {
+                    "required": True,
+                    "reason": "prompt_visible",
+                    "current_url": current_url,
+                    "keyword": keyword,
+                }
+            self._sleep(0.7, minimum_seconds=0.2)
+
+        return {
+            "required": False,
+            "reason": "logged_in",
+            "current_url": current_url,
+        }
+
     def check_home_login(
         self,
         keyword: str = XHS_HOME_LOGIN_MODAL_KEYWORD,
         wait_seconds: float = 8.0,
+        use_cache: bool = True,
     ) -> bool:
         """
         Check login state on Xiaohongshu home page.
@@ -1100,36 +1136,31 @@ class XiaohongshuPublisher:
         unauthenticated state for the xiaohongshu.com home/feed domain.
         """
         scope = "home"
-        cached_status = self._get_cached_login_status(scope)
-        if cached_status is not None:
-            if cached_status:
-                print("[cdp_publish] Home login confirmed (cached).")
-            return cached_status
+        if use_cache:
+            cached_status = self._get_cached_login_status(scope)
+            if cached_status is not None:
+                if cached_status:
+                    print("[cdp_publish] Home login confirmed (cached).")
+                return cached_status
 
         self._navigate(XHS_HOME_URL)
         self._sleep(2, minimum_seconds=1.0)
 
-        current_url = self._evaluate("window.location.href")
-        print(f"[cdp_publish] Home URL: {current_url}")
-        if isinstance(current_url, str) and "login" in current_url.lower():
+        state = self._probe_home_login_state(keyword=keyword, wait_seconds=wait_seconds)
+        if state.get("required"):
             self._set_login_cache(scope, logged_in=False)
-            print(
-                "\n[cdp_publish] NOT LOGGED IN (HOME).\n"
-                "  Please log in on xiaohongshu.com and run this command again.\n"
-            )
-            return False
-
-        deadline = time.time() + max(1.0, wait_seconds)
-        while time.time() < deadline:
-            if self._home_login_prompt_visible(keyword):
-                self._set_login_cache(scope, logged_in=False)
+            if state.get("reason") == "prompt_visible":
                 print(
                     "\n[cdp_publish] NOT LOGGED IN (HOME).\n"
                     f"  Detected login prompt keyword: {keyword}\n"
                     "  Please log in on xiaohongshu.com and run this command again.\n"
                 )
-                return False
-            self._sleep(0.7, minimum_seconds=0.2)
+            else:
+                print(
+                    "\n[cdp_publish] NOT LOGGED IN (HOME).\n"
+                    "  Please log in on xiaohongshu.com and run this command again.\n"
+                )
+            return False
 
         self._set_login_cache(scope, logged_in=True)
         print("[cdp_publish] Home login confirmed.")
@@ -1175,6 +1206,169 @@ class XiaohongshuPublisher:
             "  Please scan the QR code in the Chrome window to log in.\n"
         )
 
+    def _trigger_home_login_modal(self) -> dict[str, Any]:
+        """Try to open the xiaohongshu.com home login modal."""
+        result = self._evaluate(r"""
+            (() => {
+                const normalize = (text) => (text || "").replace(/\s+/g, " ").trim();
+                const visible = (node) => (
+                    node instanceof HTMLElement &&
+                    node.offsetParent !== null &&
+                    node.getBoundingClientRect().width > 8 &&
+                    node.getBoundingClientRect().height > 8
+                );
+
+                const promptKeyword = "登录后推荐更懂你的笔记";
+                const bodyText = normalize(document.body ? document.body.innerText : "");
+                if (bodyText.includes(promptKeyword)) {
+                    return { ok: true, reason: "login_prompt_visible" };
+                }
+
+                const exactLoginTexts = new Set([
+                    "登录",
+                    "立即登录",
+                    "去登录",
+                    "马上登录",
+                    "点击登录",
+                ]);
+                const fallbackTexts = new Set([
+                    "通知",
+                    "消息",
+                    "我的",
+                ]);
+                const selectors = [
+                    "button",
+                    "a",
+                    "[role='button']",
+                    "div",
+                    "span",
+                ];
+                const seen = new Set();
+                const candidates = [];
+
+                for (const selector of selectors) {
+                    const nodes = document.querySelectorAll(selector);
+                    for (const node of nodes) {
+                        if (!visible(node) || seen.has(node)) {
+                            continue;
+                        }
+                        seen.add(node);
+                        const text = normalize(node.textContent || node.innerText);
+                        if (!text || text.length > 18) {
+                            continue;
+                        }
+                        const href = node instanceof HTMLAnchorElement ? (node.href || "") : "";
+                        const classText = normalize(String(node.className || "")).toLowerCase();
+                        let score = 0;
+
+                        if (exactLoginTexts.has(text)) {
+                            score = 100;
+                        } else if (text.includes("登录")) {
+                            score = 80;
+                        } else if (fallbackTexts.has(text)) {
+                            score = 40;
+                        }
+
+                        if (score <= 0) {
+                            continue;
+                        }
+                        if (classText.includes("login")) {
+                            score += 20;
+                        }
+                        if (href.includes("/notification")) {
+                            score += 10;
+                        }
+                        candidates.push({ node, text, href, score });
+                    }
+                }
+
+                candidates.sort((left, right) => right.score - left.score);
+                if (!candidates.length) {
+                    return { ok: false, reason: "home_login_entry_not_found" };
+                }
+
+                const target = candidates[0];
+                target.node.click();
+                return {
+                    ok: true,
+                    reason: "clicked",
+                    text: target.text,
+                    href: target.href,
+                    score: target.score,
+                };
+            })()
+        """)
+        return result if isinstance(result, dict) else {"ok": False, "reason": "unexpected_result"}
+
+    def _switch_visible_login_qrcode_tab(self) -> dict[str, Any]:
+        """Try to switch the current login surface to QR-code mode."""
+        result = self._evaluate(r"""
+            (() => {
+                const normalize = (text) => (text || "").replace(/\s+/g, " ").trim();
+                const visible = (node) => (
+                    node instanceof HTMLElement &&
+                    node.offsetParent !== null &&
+                    node.getBoundingClientRect().width > 8 &&
+                    node.getBoundingClientRect().height > 8
+                );
+                const keywords = [
+                    "扫码登录",
+                    "二维码登录",
+                    "扫码",
+                    "QR Code",
+                    "QR",
+                ];
+                const selectors = [
+                    "button",
+                    "a",
+                    "[role='button']",
+                    "div",
+                    "span",
+                    "li",
+                ];
+                const seen = new Set();
+                const candidates = [];
+
+                for (const selector of selectors) {
+                    const nodes = document.querySelectorAll(selector);
+                    for (const node of nodes) {
+                        if (!visible(node) || seen.has(node)) {
+                            continue;
+                        }
+                        seen.add(node);
+                        const text = normalize(node.textContent || node.innerText);
+                        if (!text || text.length > 24) {
+                            continue;
+                        }
+                        const matched = keywords.find((keyword) => text.includes(keyword));
+                        if (!matched) {
+                            continue;
+                        }
+                        const classText = normalize(String(node.className || "")).toLowerCase();
+                        let score = matched === "扫码登录" || matched === "二维码登录" ? 100 : 70;
+                        if (classText.includes("tab")) {
+                            score += 10;
+                        }
+                        candidates.push({ node, text, score });
+                    }
+                }
+
+                candidates.sort((left, right) => right.score - left.score);
+                if (!candidates.length) {
+                    return { ok: false, reason: "qrcode_tab_not_found" };
+                }
+
+                const target = candidates[0];
+                target.node.click();
+                return {
+                    ok: true,
+                    reason: "clicked",
+                    text: target.text,
+                };
+            })()
+        """)
+        return result if isinstance(result, dict) else {"ok": False, "reason": "unexpected_result"}
+
     def _capture_clip_png_base64(self, rect: dict[str, Any], padding: int = 8) -> str:
         """Capture a clipped PNG screenshot and return base64 payload."""
         x = max(0.0, float(rect.get("x", 0.0)) - padding)
@@ -1202,61 +1396,181 @@ class XiaohongshuPublisher:
             raise CDPError("Failed to capture QR code screenshot.")
         return image_base64
 
-    def _locate_login_qrcode(self) -> dict[str, Any]:
-        """Return visible QR code metadata from current login page when possible."""
-        result = self._evaluate(r"""
-            (() => {
-                const normalize = (text) => (text || "").replace(/\s+/g, " ").trim();
+    def _locate_visible_qrcode(self, selectors: list[str]) -> dict[str, Any]:
+        """Return visible QR code metadata from the current page when possible."""
+        selectors_literal = json.dumps(selectors, ensure_ascii=False)
+        result = self._evaluate(f"""
+            (() => {{
+                const normalize = (text) => (text || "").replace(/\\s+/g, " ").trim();
                 const visible = (node) => (
                     node instanceof HTMLElement &&
                     node.offsetParent !== null &&
                     node.getBoundingClientRect().width >= 24 &&
                     node.getBoundingClientRect().height >= 24
                 );
-                const selectors = [
-                    ".login-container .qrcode-img",
-                    ".login-container img",
-                    "img.qrcode-img",
+                const selectors = {selectors_literal};
+                const fallbackSelectors = [
                     "img[src*='qrcode']",
+                    "img[src*='qr']",
                     "[class*='qrcode'] img",
                     "[class*='qr'] img",
                     "[class*='qrcode'] canvas",
                     "[class*='qr'] canvas",
-                    ".login-container canvas",
+                    "[class*='login'] canvas",
+                    "[class*='login'] img",
                 ];
+                const selectorList = Array.from(new Set(selectors.concat(fallbackSelectors)));
 
-                for (const selector of selectors) {
+                const isLikelyQr = (node, selector) => {{
+                    if (!(node instanceof HTMLElement)) {{
+                        return false;
+                    }}
+                    const rect = node.getBoundingClientRect();
+                    const size = Math.max(rect.width, rect.height);
+                    const nearlySquare = Math.abs(rect.width - rect.height) <= Math.max(12, size * 0.25);
+                    const src = node instanceof HTMLImageElement ? String(node.currentSrc || node.src || "") : "";
+                    const alt = node instanceof HTMLImageElement ? String(node.alt || "") : "";
+                    const classText = String(node.className || "");
+                    const parentText = normalize(
+                        node.parentElement ? (node.parentElement.innerText || node.parentElement.textContent) : ""
+                    );
+                    const ancestor = node.closest(
+                        "[class*='login'], [class*='modal'], [class*='dialog'], [class*='popup'], [class*='qrcode'], [class*='qr']"
+                    );
+                    const ancestorText = normalize(
+                        ancestor ? (ancestor.innerText || ancestor.textContent) : ""
+                    );
+                    const merged = [
+                        selector,
+                        src,
+                        alt,
+                        classText,
+                        parentText,
+                        ancestorText,
+                    ].join(" ").toLowerCase();
+
+                    if (
+                        merged.includes("qrcode")
+                        || merged.includes("qr code")
+                        || merged.includes("二维码")
+                        || merged.includes("扫码")
+                    ) {{
+                        return true;
+                    }}
+                    const contextHints = [parentText, ancestorText].join(" ");
+                    if (
+                        ancestor
+                        && nearlySquare
+                        && size >= 80
+                        && size <= 420
+                        && (
+                            node instanceof HTMLCanvasElement
+                            || contextHints.includes("二维码")
+                            || contextHints.includes("扫码")
+                            || contextHints.toLowerCase().includes("qrcode")
+                            || contextHints.toLowerCase().includes("qr code")
+                        )
+                    ) {{
+                        return true;
+                    }}
+                    return false;
+                }};
+
+                for (const selector of selectorList) {{
                     const nodes = document.querySelectorAll(selector);
-                    for (const node of nodes) {
-                        if (!visible(node)) {
+                    for (const node of nodes) {{
+                        if (!visible(node) || !isLikelyQr(node, selector)) {{
                             continue;
-                        }
+                        }}
                         const rect = node.getBoundingClientRect();
                         const src = node instanceof HTMLImageElement ? (node.currentSrc || node.src || "") : "";
                         const dataUrl = node instanceof HTMLCanvasElement ? node.toDataURL("image/png") : "";
-                        const parentText = normalize(
+                        const hintText = normalize(
                             node.parentElement ? (node.parentElement.innerText || node.parentElement.textContent) : ""
                         );
-                        return {
+                        return {{
                             ok: true,
                             tag_name: String(node.tagName || "").toLowerCase(),
                             selector,
                             src,
                             data_url: dataUrl,
-                            rect: {
+                            rect: {{
                                 x: rect.x,
                                 y: rect.y,
                                 width: rect.width,
                                 height: rect.height,
-                            },
-                            hint_text: parentText,
-                        };
-                    }
-                }
-                return { ok: false, reason: "qrcode_not_found" };
-            })()
+                            }},
+                            hint_text: hintText,
+                        }};
+                    }}
+                }}
+                return {{ ok: false, reason: "qrcode_not_found" }};
+            }})()
         """)
         return result if isinstance(result, dict) else {"ok": False, "reason": "unexpected_result"}
+
+    def _locate_login_qrcode(self) -> dict[str, Any]:
+        """Return visible QR code metadata from creator login page when possible."""
+        return self._locate_visible_qrcode(
+            selectors=[
+                ".login-container .qrcode-img",
+                ".login-container img",
+                "img.qrcode-img",
+                ".login-container canvas",
+            ]
+        )
+
+    def _locate_home_login_qrcode(self) -> dict[str, Any]:
+        """Return visible QR code metadata from home-domain login surface when possible."""
+        return self._locate_visible_qrcode(
+            selectors=[
+                "[class*='login'] [class*='qrcode'] img",
+                "[class*='login'] [class*='qr'] img",
+                "[class*='modal'] [class*='qrcode'] img",
+                "[class*='modal'] [class*='qr'] img",
+                "[class*='dialog'] [class*='qrcode'] img",
+                "[class*='dialog'] [class*='qr'] img",
+                "[class*='popup'] [class*='qrcode'] img",
+                "[class*='popup'] [class*='qr'] img",
+                "[class*='login'] canvas",
+                "[class*='modal'] canvas",
+                "[class*='dialog'] canvas",
+                "[class*='popup'] canvas",
+            ]
+        )
+
+    def _build_qrcode_payload(
+        self,
+        current_url: str,
+        qrcode_meta: dict[str, Any],
+        scope: str,
+    ) -> dict[str, Any]:
+        """Build a normalized QR-code response payload."""
+        data_url = qrcode_meta.get("data_url")
+        if isinstance(data_url, str) and data_url.startswith("data:image/"):
+            header, _, encoded = data_url.partition(",")
+            mime_type = header[5:].split(";", 1)[0] if header.startswith("data:") else "image/png"
+            image_base64 = encoded
+            qrcode_data_url = data_url
+        else:
+            rect = qrcode_meta.get("rect")
+            if not isinstance(rect, dict):
+                raise CDPError("QR code rect is missing.")
+            image_base64 = self._capture_clip_png_base64(rect)
+            mime_type = "image/png"
+            qrcode_data_url = f"data:{mime_type};base64,{image_base64}"
+
+        return {
+            "logged_in": False,
+            "scope": scope,
+            "current_url": current_url,
+            "qrcode_base64": image_base64,
+            "qrcode_data_url": qrcode_data_url,
+            "mime_type": mime_type,
+            "selector": qrcode_meta.get("selector", ""),
+            "tag_name": qrcode_meta.get("tag_name", ""),
+            "hint_text": qrcode_meta.get("hint_text", ""),
+        }
 
     def get_login_qrcode(self, wait_seconds: float = 20.0) -> dict[str, Any]:
         """Open login page and return QR code image payload for remote display."""
@@ -1293,30 +1607,116 @@ class XiaohongshuPublisher:
             reason = qrcode_meta.get("reason", "qrcode_not_found") if isinstance(qrcode_meta, dict) else "qrcode_not_found"
             raise CDPError(f"Failed to locate login QR code: {reason}")
 
-        data_url = qrcode_meta.get("data_url")
-        if isinstance(data_url, str) and data_url.startswith("data:image/"):
-            header, _, encoded = data_url.partition(",")
-            mime_type = header[5:].split(";", 1)[0] if header.startswith("data:") else "image/png"
-            image_base64 = encoded
-            qrcode_data_url = data_url
-        else:
-            rect = qrcode_meta.get("rect")
-            if not isinstance(rect, dict):
-                raise CDPError("QR code rect is missing.")
-            image_base64 = self._capture_clip_png_base64(rect)
-            mime_type = "image/png"
-            qrcode_data_url = f"data:{mime_type};base64,{image_base64}"
+        return self._build_qrcode_payload(
+            current_url=current_url,
+            qrcode_meta=qrcode_meta,
+            scope="creator",
+        )
 
-        return {
-            "logged_in": False,
-            "current_url": current_url,
-            "qrcode_base64": image_base64,
-            "qrcode_data_url": qrcode_data_url,
-            "mime_type": mime_type,
-            "selector": qrcode_meta.get("selector", ""),
-            "tag_name": qrcode_meta.get("tag_name", ""),
-            "hint_text": qrcode_meta.get("hint_text", ""),
-        }
+    def open_home_login_page(self):
+        """Navigate to xiaohongshu.com and ensure the home-domain login modal is visible."""
+        self._navigate(XHS_HOME_URL)
+        self._sleep(2, minimum_seconds=1.0)
+
+        state = self._probe_home_login_state(keyword=XHS_HOME_LOGIN_MODAL_KEYWORD, wait_seconds=1.5)
+        if not state.get("required"):
+            self._set_login_cache("home", logged_in=True)
+            print(
+                "\n[cdp_publish] Home page is already logged in.\n"
+                "  No QR code is needed on xiaohongshu.com.\n"
+            )
+            return
+
+        trigger_result = self._trigger_home_login_modal()
+        if trigger_result.get("ok") and trigger_result.get("reason") == "clicked":
+            self._sleep(1.0, minimum_seconds=0.3)
+        tab_result = self._switch_visible_login_qrcode_tab()
+        if tab_result.get("ok"):
+            self._sleep(0.8, minimum_seconds=0.25)
+
+        self._clear_login_cache(scope="home")
+        print(
+            "\n[cdp_publish] Home login surface is open.\n"
+            "  Please scan the QR code in the Chrome window to log in on xiaohongshu.com.\n"
+        )
+
+    def get_home_login_qrcode(self, wait_seconds: float = 20.0) -> dict[str, Any]:
+        """Open xiaohongshu.com login surface and return the QR code payload."""
+        if not self.ws:
+            raise CDPError("Not connected. Call connect() first.")
+
+        self._navigate(XHS_HOME_URL)
+        self._sleep(1.5, minimum_seconds=0.6)
+        state = self._probe_home_login_state(
+            keyword=XHS_HOME_LOGIN_MODAL_KEYWORD,
+            wait_seconds=2.0,
+        )
+        current_url = str(state.get("current_url") or "")
+        if not state.get("required"):
+            self._set_login_cache("home", logged_in=True)
+            return {
+                "logged_in": True,
+                "scope": "home",
+                "current_url": current_url,
+                "qrcode_base64": "",
+                "qrcode_data_url": "",
+                "mime_type": "image/png",
+                "message": "Already logged in on xiaohongshu.com.",
+            }
+
+        trigger_result = self._trigger_home_login_modal()
+        if trigger_result.get("ok") and trigger_result.get("reason") == "clicked":
+            self._sleep(1.0, minimum_seconds=0.3)
+
+        deadline = time.time() + max(3.0, float(wait_seconds))
+        qrcode_meta: dict[str, Any] | None = None
+        while time.time() < deadline:
+            qrcode_meta = self._locate_home_login_qrcode()
+            if qrcode_meta.get("ok"):
+                break
+
+            trigger_result = self._trigger_home_login_modal()
+            if trigger_result.get("ok") and trigger_result.get("reason") == "clicked":
+                self._sleep(0.8, minimum_seconds=0.25)
+                qrcode_meta = self._locate_home_login_qrcode()
+                if qrcode_meta.get("ok"):
+                    break
+
+            tab_result = self._switch_visible_login_qrcode_tab()
+            if tab_result.get("ok"):
+                self._sleep(0.8, minimum_seconds=0.25)
+                qrcode_meta = self._locate_home_login_qrcode()
+                if qrcode_meta.get("ok"):
+                    break
+
+            self._sleep(0.6, minimum_seconds=0.2)
+
+        if not qrcode_meta or not qrcode_meta.get("ok"):
+            fresh_state = self._probe_home_login_state(
+                keyword=XHS_HOME_LOGIN_MODAL_KEYWORD,
+                wait_seconds=1.0,
+            )
+            if not fresh_state.get("required"):
+                self._set_login_cache("home", logged_in=True)
+                return {
+                    "logged_in": True,
+                    "scope": "home",
+                    "current_url": str(fresh_state.get("current_url") or current_url),
+                    "qrcode_base64": "",
+                    "qrcode_data_url": "",
+                    "mime_type": "image/png",
+                    "message": "Already logged in on xiaohongshu.com.",
+                }
+
+            reason = qrcode_meta.get("reason", "qrcode_not_found") if isinstance(qrcode_meta, dict) else "qrcode_not_found"
+            raise CDPError(f"Failed to locate home login QR code: {reason}")
+
+        self._clear_login_cache(scope="home")
+        return self._build_qrcode_payload(
+            current_url=self._current_page_url(),
+            qrcode_meta=qrcode_meta,
+            scope="home",
+        )
 
     # ------------------------------------------------------------------
     # Feed discovery actions
@@ -5126,6 +5526,11 @@ def main():
 
     # check-login
     sub.add_parser("check-login", help="Check login status (exit 0=logged in, 1=not)")
+    sub.add_parser(
+        "check-home-login",
+        aliases=["check_home_login"],
+        help="Check xiaohongshu.com home-domain login status (exit 0=logged in, 1=not)",
+    )
 
     p_qrcode = sub.add_parser(
         "get-login-qrcode",
@@ -5137,6 +5542,17 @@ def main():
         type=float,
         default=20.0,
         help="Seconds to wait for QR code to appear (default: 20)",
+    )
+    p_home_qrcode = sub.add_parser(
+        "get-home-login-qrcode",
+        aliases=["get_home_login_qrcode"],
+        help="Get xiaohongshu.com home login QR code image payload for remote display",
+    )
+    p_home_qrcode.add_argument(
+        "--wait-seconds",
+        type=float,
+        default=20.0,
+        help="Seconds to wait for home login QR code to appear (default: 20)",
     )
 
     # fill - fill form without clicking publish
@@ -5423,6 +5839,7 @@ def main():
 
     # login - open browser for QR code login (always headed)
     sub.add_parser("login", help="Open browser for QR code login (always headed mode)")
+    sub.add_parser("home-login", help="Open xiaohongshu.com home login modal (always headed mode)")
 
     # re-login - clear cookies and re-login the same account (always headed)
     sub.add_parser("re-login", help="Clear cookies and re-login same account (always headed)")
@@ -5514,8 +5931,8 @@ def main():
         print(json.dumps(payload, ensure_ascii=False, indent=2))
         return
 
-    # Commands that require Chrome - login/re-login/switch-account always headed
-    if args.command in ("login", "re-login", "switch-account"):
+    # Commands that require Chrome - login/re-login/switch-account/home-login always headed
+    if args.command in ("login", "home-login", "re-login", "switch-account"):
         headless = False
 
     if local_mode:
@@ -5551,10 +5968,26 @@ def main():
                 )
             sys.exit(0 if logged_in else 1)
 
+        elif args.command in ("check-home-login", "check_home_login"):
+            publisher.connect(reuse_existing_tab=reuse_existing_tab)
+            logged_in = publisher.check_home_login()
+            if not logged_in and headless:
+                print(
+                    "[cdp_publish] Headless mode: home login requires QR scanning.\n"
+                    "  Run with 'home-login' or 'get-home-login-qrcode' to continue."
+                )
+            sys.exit(0 if logged_in else 1)
+
         elif args.command in ("get-login-qrcode", "get_login_qrcode"):
             publisher.connect(reuse_existing_tab=reuse_existing_tab)
             payload = publisher.get_login_qrcode(wait_seconds=args.wait_seconds)
             print("GET_LOGIN_QRCODE_RESULT:")
+            print(json.dumps(payload, ensure_ascii=False, indent=2))
+
+        elif args.command in ("get-home-login-qrcode", "get_home_login_qrcode"):
+            publisher.connect(reuse_existing_tab=reuse_existing_tab)
+            payload = publisher.get_home_login_qrcode(wait_seconds=args.wait_seconds)
+            print("GET_HOME_LOGIN_QRCODE_RESULT:")
             print(json.dumps(payload, ensure_ascii=False, indent=2))
 
         elif args.command in ("fill", "publish"):
@@ -5859,6 +6292,13 @@ def main():
             publisher.connect(reuse_existing_tab=reuse_existing_tab)
             publisher.open_login_page()
             print("LOGIN_READY")
+
+        elif args.command == "home-login":
+            if local_mode:
+                restart_chrome(port=port, headless=False, account=account)
+            publisher.connect(reuse_existing_tab=reuse_existing_tab)
+            publisher.open_home_login_page()
+            print("HOME_LOGIN_READY")
 
         elif args.command == "re-login":
             # Ensure headed mode, clear cookies, re-open login page for same account

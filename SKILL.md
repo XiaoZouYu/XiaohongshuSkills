@@ -98,6 +98,7 @@ python scripts/chrome_launcher.py --headless
 
 # 检查当前登录状态
 python scripts/cdp_publish.py check-login
+python scripts/cdp_publish.py check-home-login
 
 # 常见变体：优先复用已有标签页
 python scripts/cdp_publish.py --reuse-existing-tab check-login
@@ -105,8 +106,14 @@ python scripts/cdp_publish.py --reuse-existing-tab check-login
 # 远程 CDP 检查登录
 python scripts/cdp_publish.py --host 10.0.0.12 --port 9222 check-login
 
-# 获取登录二维码（返回 Base64，可供远程前端展示扫码）
+# 获取创作者中心登录二维码（返回 Base64，可供远程前端展示扫码）
 python scripts/cdp_publish.py get-login-qrcode
+
+# 获取主页域登录二维码（商家主页/评论任务优先使用）
+python scripts/cdp_publish.py get-home-login-qrcode
+
+# 打开主页域登录弹窗（有窗口）
+python scripts/cdp_publish.py home-login
 
 # 重启 / 关闭测试浏览器
 python scripts/chrome_launcher.py --restart
@@ -236,6 +243,8 @@ python scripts/cdp_publish.py get-feed-detail \
 说明：`search-feeds` 输出中包含 `recommended_keywords_count` 与 `recommended_keywords`，表示回车前搜索框下拉推荐词。
 说明：`get-feed-detail --load-all-comments` 会先滚动评论区，并可选点击“更多回复”后再提取详情，同时额外返回 `comment_loading`。
 说明：需要“分批读评论并持续推进”时，不要重复调用 `get-feed-detail` 轮询，优先改用 `comment-session-start` / `comment-session-step`。
+说明：`check-login` / `get-login-qrcode` / `login` 走的是创作者中心 `creator.xiaohongshu.com` 登录域。
+说明：`check-home-login` / `get-home-login-qrcode` / `home-login` 走的是主页域 `www.xiaohongshu.com` 登录域；商家主页、笔记和评论任务应优先使用这套命令。
 说明：`check-login` 与主页登录检查默认启用本地缓存（12h，仅缓存“已登录”），到期后自动重新网页校验。
 
 ### 6) 给笔记发表评论（一级评论）
@@ -345,7 +354,7 @@ python scripts/cdp_publish.py comment-session-close \
 
 ## 失败处理
 
-- 登录失败：提示用户重新扫码登录并重试；若用户需要远程展示二维码，可改用 `get-login-qrcode`。
+- 登录失败：提示用户重新扫码登录并重试；创作者中心任务优先用 `get-login-qrcode`，主页域任务优先用 `get-home-login-qrcode`。
 - 图片/视频下载失败：提示更换 URL 或改用本地文件。
 - 本地路径不可用：优先改用绝对路径；若为 WSL/远程 CDP 的 Windows/UNC 路径，可先尝试 `--skip-file-check`，必要时再加 `--preserve-upload-paths`。
 - 评论/回复目标未定位成功：提示补充 `comment_id`，或改用 `comment_author` / `comment_snippet` 再试。

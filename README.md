@@ -14,7 +14,7 @@
 - **远程 CDP 支持**：可通过 `--host` / `--port` 连接远程 Chrome 调试端口
 - **图片下载**：支持从 URL 自动下载图片，自动添加 Referer 绕过防盗链
 - **登录检测**：自动检测登录状态，未登录时自动切换到有窗口模式扫码
-- **登录二维码导出**：支持返回登录二维码 Base64 图片，便于远程前端展示扫码
+- **登录二维码导出**：支持返回创作者中心与主页域登录二维码 Base64 图片，便于远程前端展示扫码
 - **登录状态缓存**：`check_login/check_home_login` 默认本地缓存 12 小时，减少重复跳转校验
 - **首页推荐流抓取**：支持抓取首页推荐 feed 列表
 - **内容检索与详情读取**：支持搜索笔记并获取指定笔记详情（含评论数据），详情可选滚动加载更多评论/回复
@@ -63,15 +63,22 @@ python scripts/chrome_launcher.py --headless
 
 # 检查当前登录状态
 python scripts/cdp_publish.py check-login
+python scripts/cdp_publish.py check-home-login
 
-# 获取登录二维码（返回 Base64，可供远程前端直接展示）
+# 获取创作者中心登录二维码（返回 Base64，可供远程前端直接展示）
 python scripts/cdp_publish.py get-login-qrcode
+
+# 获取主页域登录二维码（商家主页/评论任务优先使用）
+python scripts/cdp_publish.py get-home-login-qrcode
 
 # 可选：优先复用已有标签页（减少有窗口模式下切到前台）
 python scripts/cdp_publish.py check-login --reuse-existing-tab
 
 # 连接远程 CDP（Chrome 在另一台机器）
 python scripts/cdp_publish.py --host 10.0.0.12 --port 9222 check-login
+
+# 打开主页域登录弹窗（有窗口）
+python scripts/cdp_publish.py home-login
 
 # 重启测试浏览器
 python scripts/chrome_launcher.py --restart
@@ -317,6 +324,7 @@ python scripts/publish_pipeline.py [选项]
 ```bash
 # 检查登录状态
 python scripts/cdp_publish.py check-login
+python scripts/cdp_publish.py check-home-login
 python scripts/cdp_publish.py check-login --reuse-existing-tab
 python scripts/cdp_publish.py --host 10.0.0.12 --port 9222 check-login
 
@@ -328,8 +336,14 @@ python scripts/cdp_publish.py --host 10.0.0.12 --port 9222 fill --title "标题"
 # 点击发布按钮
 python scripts/cdp_publish.py click-publish
 
-# 获取登录二维码（支持下划线别名：get_login_qrcode）
+# 获取创作者中心登录二维码（支持下划线别名：get_login_qrcode）
 python scripts/cdp_publish.py get-login-qrcode
+
+# 获取主页域登录二维码（支持下划线别名：get_home_login_qrcode）
+python scripts/cdp_publish.py get-home-login-qrcode
+
+# 打开主页域登录弹窗
+python scripts/cdp_publish.py home-login
 
 # 首页推荐列表（支持下划线别名：list_feeds）
 python scripts/cdp_publish.py list-feeds
@@ -381,9 +395,11 @@ python scripts/cdp_publish.py set-default-account NAME
 python scripts/cdp_publish.py switch-account
 ```
 
+说明：`check-login` / `get-login-qrcode` / `login` 走的是创作者中心 `creator.xiaohongshu.com` 登录域。
+说明：`check-home-login` / `get-home-login-qrcode` / `home-login` 走的是主页域 `www.xiaohongshu.com` 登录域；商家主页、笔记和评论任务应优先使用这套命令。
 说明：`list-feeds`、`search-feeds`、`get-feed-detail`、`post-comment-to-feed`、`respond-comment`、`note-upvote`、`note-unvote`、`note-bookmark`、`note-unbookmark`、`profile-snapshot`、`notes-from-profile` 与 `get-notification-mentions` 会校验 `xiaohongshu.com` 主页登录态（非创作者中心登录态）。
 说明：登录态检查默认启用本地缓存（12 小时，仅缓存“已登录”结果），到期后自动重新走网页校验。
-说明：`get-login-qrcode` 返回 `qrcode_base64` / `qrcode_data_url`，便于远程前端直接展示扫码。
+说明：`get-login-qrcode` 与 `get-home-login-qrcode` 都会返回 `qrcode_base64` / `qrcode_data_url`，便于远程前端直接展示扫码。
 说明：`search-feeds` 输出新增 `recommended_keywords_count` 与 `recommended_keywords` 字段，表示输入关键词后回车前的下拉推荐词。
 说明：`get-feed-detail --load-all-comments` 额外返回 `comment_loading`，用于说明评论滚动加载结果。
 说明：`comment-session-start` / `comment-session-step` 会返回 `batch`、`awaiting_decisions`、`completed` 与 `comment_loading` 等字段，方便外部编排系统持续推进评论处理。
