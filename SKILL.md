@@ -64,7 +64,7 @@ metadata:
 6. 若用户需要回复某条评论，执行 `respond-comment`（可用 `comment_id` / `comment_author` / `comment_snippet` 定位目标评论）。
 7. 若用户需要“读取一批评论 -> 外部决策 -> 原地回复 -> 继续往下滑”的连续工作流，优先使用 `comment-session-start` / `comment-session-step` / `comment-session-close`。`start` 负责拿首批评论，`step` 负责应用当前批次决策并推进到下一批，`close` 负责收尾。
 8. 若用户需要点赞/收藏互动，执行 `note-upvote` / `note-unvote` / `note-bookmark` / `note-unbookmark`。
-9. 若用户需要用户主页信息，执行 `profile-snapshot` 或 `notes-from-profile`。
+9. 若用户需要用户主页信息，执行 `profile-snapshot` 或 `notes-from-profile`。`notes-from-profile` 现在会优先走 `user_posted` 接口抓取笔记列表与 `xsec_token`。
 10. 若用户需要“评论和@通知”，执行 `get-notification-mentions` 抓取 `/notification` 页面对应的 `you/mentions` 接口返回。
 11. 若用户需要“笔记基础信息表”，执行 `content-data` 获取曝光/观看/点赞等指标。
 12. 回传结构化结果（数量、核心字段、链接）。
@@ -243,6 +243,7 @@ python scripts/cdp_publish.py get-feed-detail \
 说明：`search-feeds` 输出中包含 `recommended_keywords_count` 与 `recommended_keywords`，表示回车前搜索框下拉推荐词。
 说明：`get-feed-detail --load-all-comments` 会先滚动评论区，并可选点击“更多回复”后再提取详情，同时额外返回 `comment_loading`。
 说明：需要“分批读评论并持续推进”时，不要重复调用 `get-feed-detail` 轮询，优先改用 `comment-session-start` / `comment-session-step`。
+说明：`notes-from-profile` 会优先调用 `user_posted` 接口抓取主页笔记列表，因此商家主页场景下更容易直接拿到 `note_id + xsec_token`。
 说明：`check-login` / `get-login-qrcode` / `login` 走的是创作者中心 `creator.xiaohongshu.com` 登录域。
 说明：`check-home-login` / `get-home-login-qrcode` / `home-login` 走的是主页域 `www.xiaohongshu.com` 登录域；商家主页、笔记和评论任务应优先使用这套命令。
 说明：`check-login` 与主页登录检查默认启用本地缓存（12h，仅缓存“已登录”），到期后自动重新网页校验。

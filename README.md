@@ -22,7 +22,7 @@
 - **评论回复**：支持按评论定位条件（评论 ID / 作者 / 文本片段）回复指定评论
 - **评论巡检会话**：支持按批次提取当前可见评论、外部决策后原地回复，再继续下滑处理后续评论
 - **互动动作控制**：支持对指定笔记执行点赞/取消点赞、收藏/取消收藏
-- **用户页信息提取**：支持抓取用户主页快照与主页笔记列表
+- **用户页信息提取**：支持抓取用户主页快照与主页笔记列表，`notes-from-profile` 会优先使用 `user_posted` 接口获取 `xsec_token`
 - **通知评论抓取**：支持在 `/notification` 页面抓取 `you/mentions` 接口返回
 - **内容数据看板抓取**：支持抓取“笔记基础信息”表（曝光/观看/点赞等）并导出 CSV
 
@@ -400,6 +400,7 @@ python scripts/cdp_publish.py switch-account
 说明：`list-feeds`、`search-feeds`、`get-feed-detail`、`post-comment-to-feed`、`respond-comment`、`note-upvote`、`note-unvote`、`note-bookmark`、`note-unbookmark`、`profile-snapshot`、`notes-from-profile` 与 `get-notification-mentions` 会校验 `xiaohongshu.com` 主页登录态（非创作者中心登录态）。
 说明：登录态检查默认启用本地缓存（12 小时，仅缓存“已登录”结果），到期后自动重新走网页校验。
 说明：`get-login-qrcode` 与 `get-home-login-qrcode` 都会返回 `qrcode_base64` / `qrcode_data_url`，便于远程前端直接展示扫码。
+说明：`notes-from-profile` 现在会优先调用 `user_posted` 接口获取主页笔记列表，因此更容易直接拿到 `note_id + xsec_token`；接口失败时才退回 DOM 滚动抓取。
 说明：`search-feeds` 输出新增 `recommended_keywords_count` 与 `recommended_keywords` 字段，表示输入关键词后回车前的下拉推荐词。
 说明：`get-feed-detail --load-all-comments` 额外返回 `comment_loading`，用于说明评论滚动加载结果。
 说明：`comment-session-start` / `comment-session-step` 会返回 `batch`、`awaiting_decisions`、`completed` 与 `comment_loading` 等字段，方便外部编排系统持续推进评论处理。
