@@ -114,7 +114,6 @@ XHS_CONTENT_DATA_URL = "https://creator.xiaohongshu.com/statistics/data-analysis
 XHS_CONTENT_DATA_API_PATH = "/api/galaxy/creator/datacenter/note/analyze/list"
 XHS_NOTIFICATION_MENTIONS_API_PATH = "/api/sns/web/v1/you/mentions"
 XHS_SEARCH_RECOMMEND_API_PATH = "/api/sns/web/v1/search/recommend"
-XHS_USER_POSTED_API_URL = "https://edith.xiaohongshu.com/api/sns/web/v1/user_posted"
 XHS_FEED_INACCESSIBLE_KEYWORDS = (
     "当前笔记暂时无法浏览",
     "该内容因违规已被删除",
@@ -175,7 +174,7 @@ LOGIN_CACHE_FILE = os.path.abspath(
 COMMENT_REVIEW_SESSION_VERSION = 1
 COMMENT_REVIEW_DEFAULT_BATCH_SIZE = 10
 COMMENT_REVIEW_MAX_BATCH_SIZE = 30
-COMMENT_REVIEW_DEFAULT_SCROLL_ROUNDS = 8
+COMMENT_REVIEW_DEFAULT_SCROLL_ROUNDS = 12
 COMMENT_REVIEW_MAX_SCROLL_ROUNDS = 30
 
 
@@ -2496,285 +2495,6 @@ class XiaohongshuPublisher:
             return f"https://www.xiaohongshu.com/user/profile/{user_id.strip()}"
         raise CDPError("Either --profile-url or --user-id is required.")
 
-    def _extract_profile_user_id_from_page(self) -> str:
-        """Extract profile user id from current page URL or page state."""
-        result = self._evaluate(
-            """
-            (() => {
-                const normalize = (text) => (text || "").replace(/\\s+/g, " ").trim();
-                const extractFromUrl = (value) => {
-                    if (!value) {
-                        return "";
-                    }
-                    const match = String(value).match(/\\/user\\/profile\\/([0-9a-zA-Z]+)/);
-                    return match ? normalize(match[1]) : "";
-                };
-
-                const fromLocation = extractFromUrl(window.location.href);
-                if (fromLocation) {
-                    return fromLocation;
-                }
-
-                const state = window.__INITIAL_STATE__ || {};
-                const queue = [state];
-                const seen = new Set();
-                let scanCount = 0;
-
-                while (queue.length && scanCount < 2400) {
-                    scanCount += 1;
-                    const node = queue.shift();
-                    if (!node || typeof node !== "object") {
-                        continue;
-                    }
-                    if (seen.has(node)) {
-                        continue;
-                    }
-                    seen.add(node);
-
-                    if (!Array.isArray(node)) {
-                        const candidates = [
-                            node.userId,
-                            node.user_id,
-                            node.userid,
-                            node.uid,
-                            node.redId,
-                            node.red_id,
-                        ];
-                        for (const value of candidates) {
-                            const normalized = normalize(value);
-                            if (normalized) {
-                                return normalized;
-                            }
-                        }
-                    }
-
-                    if (Array.isArray(node)) {
-                        for (const item of node) {
-                            if (item && typeof item === "object") {
-                                queue.push(item);
-                            }
-                        }
-                        continue;
-                    }
-
-                    for (const key of Object.keys(node).slice(0, 120)) {
-                        const value = node[key];
-                        if (value && typeof value === "object") {
-                            queue.push(value);
-                        }
-                    }
-                }
-
-                const profileLinks = document.querySelectorAll("a[href*='/user/profile/']");
-                for (const link of profileLinks) {
-                    if (!(link instanceof HTMLAnchorElement)) {
-                        continue;
-                    }
-                    const extracted = extractFromUrl(link.href || link.getAttribute("href") || "");
-                    if (extracted) {
-                        return extracted;
-                    }
-                }
-                return "";
-            })()
-            """
-        )
-        return result.strip() if isinstance(result, str) else ""
-
-    def _map_user_posted_note(self, item: dict[str, Any]) -> dict[str, Any] | None:
-        """Normalize one user_posted API note item."""
-        note_id = ""
-        for key in ("note_id", "noteId", "id"):
-            raw = item.get(key)
-            if isinstance(raw, str) and raw.strip():
-                note_id = raw.strip()
-                break
-        if not note_id:
-            return None
-
-        xsec_token = ""
-        raw_xsec_token = item.get("xsec_token")
-        if isinstance(raw_xsec_token, str):
-            xsec_token = raw_xsec_token.strip()
-
-        display_title = item.get("display_title")
-        title = display_title.strip() if isinstance(display_title, str) else ""
-        if not title:
-            raw_title = item.get("title")
-            if isinstance(raw_title, str):
-                title = raw_title.strip()
-
-        cover = ""
-        cover_payload = item.get("cover")
-        if isinstance(cover_payload, dict):
-            for key in ("url_default", "url_pre", "url"):
-                raw_cover = cover_payload.get(key)
-                if isinstance(raw_cover, str) and raw_cover.strip():
-                    cover = raw_cover.strip()
-                    break
-            if not cover:
-                info_list = cover_payload.get("info_list")
-                if isinstance(info_list, list):
-                    for entry in info_list:
-                        if not isinstance(entry, dict):
-                            continue
-                        raw_url = entry.get("url")
-                        if isinstance(raw_url, str) and raw_url.strip():
-                            cover = raw_url.strip()
-                            break
-
-        note_url = f"https://www.xiaohongshu.com/explore/{note_id}"
-        if xsec_token:
-            note_url = f"{note_url}?{urlencode({'xsec_token': xsec_token, 'xsec_source': 'pc_user'})}"
-
-        return {
-            "id": note_id,
-            "xsec_token": xsec_token,
-            "note_url": note_url,
-            "title": title,
-            "cover": cover,
-        }
-
-    def _fetch_profile_notes_via_user_posted_api(
-        self,
-        user_id: str,
-        limit: int,
-    ) -> dict[str, Any]:
-        """Fetch profile notes via user_posted API to obtain stable xsec_token values."""
-        safe_limit = max(1, min(100, int(limit)))
-        notes: list[dict[str, Any]] = []
-        seen_ids: set[str] = set()
-        cursor = ""
-        next_cursor: str | None = None
-        has_more = False
-        request_count = 0
-
-        while len(notes) < safe_limit:
-            batch_size = min(30, safe_limit - len(notes))
-            query = {
-                "num": batch_size,
-                "cursor": cursor,
-                "user_id": user_id,
-                "image_formats": "jpg,webp,avif",
-                "xsec_token": "",
-                "xsec_source": "",
-            }
-            request_url = f"{XHS_USER_POSTED_API_URL}?{urlencode(query)}"
-            result = self._evaluate(
-                f"""
-                (async () => {{
-                    try {{
-                        const response = await fetch({json.dumps(request_url)}, {{
-                            method: "GET",
-                            credentials: "include",
-                            cache: "no-store",
-                            headers: {{
-                                "Accept": "application/json, text/plain, */*"
-                            }}
-                        }});
-                        const body = await response.text();
-                        return {{
-                            ok: response.ok,
-                            status: response.status,
-                            url: response.url,
-                            body,
-                        }};
-                    }} catch (error) {{
-                        return {{
-                            ok: false,
-                            status: 0,
-                            url: {json.dumps(request_url)},
-                            error: String(error),
-                            body: "",
-                        }};
-                    }}
-                }})()
-                """
-            )
-            request_count += 1
-
-            if not isinstance(result, dict):
-                raise CDPError("Unexpected user_posted fetch result.")
-            if not result.get("ok"):
-                raise CDPError(
-                    "Profile notes API fetch failed: "
-                    f"status={result.get('status')}, error={result.get('error') or 'unknown'}"
-                )
-
-            body_text = result.get("body", "")
-            try:
-                payload = json.loads(body_text)
-            except json.JSONDecodeError as exc:
-                raise CDPError(
-                    "Failed to decode user_posted API JSON: "
-                    f"{exc}; preview={body_text[:300]}"
-                ) from exc
-
-            if not isinstance(payload, dict):
-                raise CDPError("Unexpected user_posted payload structure.")
-
-            success = payload.get("success")
-            if success is False:
-                raise CDPError(
-                    "user_posted API returned failure: "
-                    f"{payload.get('msg') or payload.get('message') or 'unknown'}"
-                )
-
-            data = payload.get("data")
-            if not isinstance(data, dict):
-                raise CDPError("user_posted API data field is missing.")
-
-            raw_notes = None
-            for key in ("notes", "note_list", "notes_list"):
-                candidate = data.get(key)
-                if isinstance(candidate, list):
-                    raw_notes = candidate
-                    break
-            if raw_notes is None:
-                raw_notes = []
-
-            for item in raw_notes:
-                if not isinstance(item, dict):
-                    continue
-                mapped = self._map_user_posted_note(item)
-                if not mapped:
-                    continue
-                note_id = mapped["id"]
-                if note_id in seen_ids:
-                    continue
-                seen_ids.add(note_id)
-                notes.append(mapped)
-                if len(notes) >= safe_limit:
-                    break
-
-            next_cursor = ""
-            raw_cursor = data.get("cursor")
-            if isinstance(raw_cursor, str):
-                next_cursor = raw_cursor.strip()
-            elif raw_cursor is not None:
-                next_cursor = str(raw_cursor).strip()
-
-            has_more_value = data.get("has_more")
-            if isinstance(has_more_value, bool):
-                has_more = has_more_value
-            else:
-                has_more = bool(raw_notes) and bool(next_cursor) and next_cursor != cursor
-
-            if not raw_notes or not has_more or not next_cursor or len(notes) >= safe_limit:
-                break
-            cursor = next_cursor
-
-        return {
-            "user_id": user_id,
-            "count": len(notes),
-            "limit": safe_limit,
-            "notes": notes[:safe_limit],
-            "cursor": next_cursor or "",
-            "has_more": bool(has_more),
-            "request_count": request_count,
-            "source": "user_posted_api",
-        }
-
     def get_profile_snapshot(
         self,
         profile_url: str | None = None,
@@ -3011,6 +2731,140 @@ class XiaohongshuPublisher:
             return {"ok": False, "reason": "invalid_dom_payload", "notes": []}
         return result
 
+    def _extract_note_cards_from_profile_state(self, limit: int) -> dict[str, Any]:
+        """Extract note cards from profile page initial state."""
+        safe_limit = max(1, int(limit))
+        result = self._evaluate(
+            f"""
+            (() => {{
+                const limit = {safe_limit};
+                const normalize = (text) => (text || "").replace(/\\s+/g, " ").trim();
+                const state = window.__INITIAL_STATE__ || {{}};
+                const seenObjects = new Set();
+                const queue = [state];
+                const seenIds = new Set();
+                const notes = [];
+                let scanCount = 0;
+
+                const noteIdPattern = /^[0-9a-zA-Z]{{24}}$/;
+                const toAbs = (href) => {{
+                    try {{
+                        return new URL(href, window.location.href).href;
+                    }} catch (error) {{
+                        return "";
+                    }}
+                }};
+                const pickFirst = (obj, keys) => {{
+                    if (!obj || typeof obj !== "object") {{
+                        return "";
+                    }}
+                    for (const key of keys) {{
+                        const value = obj[key];
+                        if (typeof value === "string" && normalize(value)) {{
+                            return normalize(value);
+                        }}
+                    }}
+                    return "";
+                }};
+                const parseCover = (node) => {{
+                    if (!node || typeof node !== "object") {{
+                        return "";
+                    }}
+                    const directKeys = ["cover", "image", "image_url", "url_default", "url_pre", "url"];
+                    for (const key of directKeys) {{
+                        const value = node[key];
+                        if (typeof value === "string" && normalize(value)) {{
+                            return normalize(value);
+                        }}
+                    }}
+                    const cover = node.cover;
+                    if (cover && typeof cover === "object") {{
+                        for (const key of ["url_default", "url_pre", "url"]) {{
+                            const value = cover[key];
+                            if (typeof value === "string" && normalize(value)) {{
+                                return normalize(value);
+                            }}
+                        }}
+                        if (Array.isArray(cover.info_list)) {{
+                            for (const item of cover.info_list) {{
+                                if (item && typeof item === "object" && typeof item.url === "string" && normalize(item.url)) {{
+                                    return normalize(item.url);
+                                }}
+                            }}
+                        }}
+                    }}
+                    return "";
+                }};
+                const pushNote = (node) => {{
+                    if (!node || typeof node !== "object") {{
+                        return;
+                    }}
+                    const noteId = pickFirst(node, ["note_id", "noteId", "id"]);
+                    if (!noteId || !noteIdPattern.test(noteId) || seenIds.has(noteId)) {{
+                        return;
+                    }}
+                    const xsecToken = pickFirst(node, ["xsec_token", "xsecToken"]);
+                    if (!xsecToken) {{
+                        return;
+                    }}
+                    const title = pickFirst(node, ["display_title", "title", "name"]);
+                    const cover = parseCover(node);
+                    const noteUrl = toAbs(
+                        `/explore/${{noteId}}?xsec_token=${{encodeURIComponent(xsecToken)}}&xsec_source=pc_user`
+                    );
+                    seenIds.add(noteId);
+                    notes.push({{
+                        id: noteId,
+                        xsec_token: xsecToken,
+                        note_url: noteUrl,
+                        title,
+                        cover,
+                    }});
+                }};
+
+                while (queue.length && notes.length < limit && scanCount < 6000) {{
+                    scanCount += 1;
+                    const node = queue.shift();
+                    if (!node || typeof node !== "object") {{
+                        continue;
+                    }}
+                    if (seenObjects.has(node)) {{
+                        continue;
+                    }}
+                    seenObjects.add(node);
+
+                    if (Array.isArray(node)) {{
+                        for (const item of node) {{
+                            if (item && typeof item === "object") {{
+                                queue.push(item);
+                            }}
+                        }}
+                        continue;
+                    }}
+
+                    pushNote(node);
+                    for (const value of Object.values(node).slice(0, 160)) {{
+                        if (value && typeof value === "object") {{
+                            queue.push(value);
+                        }}
+                    }}
+                }}
+
+                return {{
+                    ok: true,
+                    notes: notes.slice(0, limit),
+                    count: notes.length,
+                    page_url: window.location.href,
+                    source: "profile_initial_state",
+                }};
+            }})()
+            """
+        )
+
+        if not isinstance(result, dict):
+            return {"ok": False, "reason": "invalid_state_payload", "notes": []}
+        return result
+
     def list_profile_notes(
         self,
         profile_url: str | None = None,
@@ -3029,31 +2883,33 @@ class XiaohongshuPublisher:
         self._navigate(target_url)
         self._sleep(2.0, minimum_seconds=0.8)
 
-        resolved_user_id = (user_id or "").strip() or self._extract_profile_user_id_from_page()
-        if resolved_user_id:
-            try:
-                api_result = self._fetch_profile_notes_via_user_posted_api(
-                    user_id=resolved_user_id,
-                    limit=safe_limit,
-                )
-                return {
-                    "profile_url": target_url,
-                    "user_id": resolved_user_id,
-                    "count": api_result["count"],
-                    "limit": safe_limit,
-                    "notes": api_result["notes"],
-                    "cursor": api_result.get("cursor", ""),
-                    "has_more": bool(api_result.get("has_more")),
-                    "source": api_result.get("source", "user_posted_api"),
-                    "request_count": int(api_result.get("request_count", 0)),
-                }
-            except CDPError as exc:
-                print(
-                    "[cdp_publish] Warning: user_posted API fetch failed. "
-                    f"Falling back to DOM extraction. reason={exc}"
-                )
-
         best_notes: list[dict[str, Any]] = []
+        page_url = target_url
+        best_source = "profile_dom"
+
+        for _ in range(safe_scrolls + 1):
+            extracted_state = self._extract_note_cards_from_profile_state(limit=safe_limit)
+            state_notes = extracted_state.get("notes", []) if isinstance(extracted_state, dict) else []
+            if isinstance(extracted_state, dict) and extracted_state.get("page_url"):
+                page_url = str(extracted_state["page_url"])
+            if isinstance(state_notes, list) and len(state_notes) > len(best_notes):
+                best_notes = state_notes
+                best_source = "profile_initial_state"
+            if len(best_notes) >= safe_limit:
+                break
+            self._evaluate("window.scrollTo(0, document.body.scrollHeight); true;")
+            self._sleep(1.2, minimum_seconds=0.4)
+
+        if best_notes:
+            return {
+                "profile_url": page_url,
+                "count": len(best_notes),
+                "limit": safe_limit,
+                "notes": best_notes[:safe_limit],
+                "source": best_source,
+            }
+
+        best_notes = []
         page_url = target_url
 
         for _ in range(safe_scrolls + 1):
@@ -3070,7 +2926,6 @@ class XiaohongshuPublisher:
 
         return {
             "profile_url": page_url,
-            "user_id": resolved_user_id,
             "count": len(best_notes),
             "limit": safe_limit,
             "notes": best_notes[:safe_limit],
@@ -3143,15 +2998,18 @@ class XiaohongshuPublisher:
         self,
         limit: int = COMMENT_REVIEW_DEFAULT_BATCH_SIZE,
         include_replies: bool = False,
+        skip_owner_replied: bool = True,
     ) -> list[dict[str, Any]]:
         """Extract a visible batch of comment items from the current detail page."""
         safe_limit = _normalize_comment_batch_size(limit)
         raw_limit = max(safe_limit * 3, safe_limit)
         include_replies_literal = "true" if include_replies else "false"
+        skip_owner_replied_literal = "true" if skip_owner_replied else "false"
 
         raw_result = self._evaluate(f"""
             (() => {{
                 const includeReplies = {include_replies_literal};
+                const skipOwnerReplied = {skip_owner_replied_literal};
                 const limit = {raw_limit};
                 const normalize = (text) => (text || "").replace(/\\s+/g, " ").trim();
                 const visible = (node) => (
@@ -3211,6 +3069,50 @@ class XiaohongshuPublisher:
                         )
                         : null;
                     return !!ancestor;
+                }};
+                const resolveOwnerNickname = () => {{
+                    const state = window.__INITIAL_STATE__ || {{}};
+                    const candidates = [];
+                    const pushText = (value) => {{
+                        const text = normalize(value);
+                        if (text) {{
+                            candidates.push(text);
+                        }}
+                    }};
+                    const detailMap = state.note && state.note.noteDetailMap;
+                    if (detailMap && typeof detailMap === "object") {{
+                        const keys = Object.keys(detailMap);
+                        for (const key of keys.slice(0, 3)) {{
+                            const detail = detailMap[key];
+                            if (!detail || typeof detail !== "object") {{
+                                continue;
+                            }}
+                            pushText(detail.nickname);
+                            pushText(detail.author && (detail.author.nickname || detail.author.nickName || detail.author.name));
+                            pushText(detail.user && (detail.user.nickname || detail.user.nickName || detail.user.name));
+                            pushText(detail.note && detail.note.user && (detail.note.user.nickname || detail.note.user.nickName || detail.note.user.name));
+                            pushText(detail.note_card && detail.note_card.user && (detail.note_card.user.nickname || detail.note_card.user.nickName || detail.note_card.user.name));
+                        }}
+                    }}
+                    const headerSelectors = [
+                        ".author-container .author-name",
+                        "[class*='author-container'] [class*='author']",
+                        "[class*='note'] [class*='author']",
+                        "header [class*='author']",
+                    ];
+                    for (const selector of headerSelectors) {{
+                        const node = document.querySelector(selector);
+                        if (!(node instanceof HTMLElement) || !visible(node)) {{
+                            continue;
+                        }}
+                        pushText(node.textContent || node.innerText);
+                    }}
+                    for (const text of candidates) {{
+                        if (text.length <= 80) {{
+                            return text;
+                        }}
+                    }}
+                    return "";
                 }};
                 const findReplyControl = (container) => {{
                     const selectors = [
@@ -3290,6 +3192,32 @@ class XiaohongshuPublisher:
                         }}
                     }}
                     return "";
+                }};
+                const extractVisibleAuthorTexts = (rootNode) => {{
+                    if (!(rootNode instanceof HTMLElement)) {{
+                        return [];
+                    }}
+                    const texts = [];
+                    const selectors = [
+                        "[class*='author']",
+                        "[class*='name']",
+                        "[class*='user']",
+                        "a[href*='/user/profile/']",
+                    ];
+                    for (const selector of selectors) {{
+                        const nodes = rootNode.querySelectorAll(selector);
+                        for (const node of nodes) {{
+                            if (!visible(node)) {{
+                                continue;
+                            }}
+                            const text = normalize(node.textContent || node.innerText);
+                            if (!text || text.length > 80) {{
+                                continue;
+                            }}
+                            texts.push(text);
+                        }}
+                    }}
+                    return Array.from(new Set(texts));
                 }};
                 const removeMatches = (root, selectors) => {{
                     for (const selector of selectors) {{
@@ -3390,6 +3318,7 @@ class XiaohongshuPublisher:
                 const root = document.querySelector('.comments-container') || document.body;
                 const seenNodes = new Set();
                 const collected = [];
+                const ownerNickname = resolveOwnerNickname();
 
                 for (const selector of selectors) {{
                     const nodes = root.querySelectorAll(selector);
@@ -3417,6 +3346,24 @@ class XiaohongshuPublisher:
                         if (!content) {{
                             continue;
                         }}
+                        const isOwnerComment = !!ownerNickname && author === ownerNickname;
+                        const replyNodes = node.querySelectorAll(
+                            ".reply-item, [class*='reply-item'], .sub-comment, [class*='sub-comment'], .child-comment, [class*='child-comment']"
+                        );
+                        let repliedByOwner = false;
+                        for (const replyNode of replyNodes) {{
+                            if (!(replyNode instanceof HTMLElement) || !visible(replyNode)) {{
+                                continue;
+                            }}
+                            const replyAuthors = extractVisibleAuthorTexts(replyNode);
+                            if (ownerNickname && replyAuthors.includes(ownerNickname)) {{
+                                repliedByOwner = true;
+                                break;
+                            }}
+                        }}
+                        if (skipOwnerReplied && (isOwnerComment || repliedByOwner)) {{
+                            continue;
+                        }}
                         const metaText = extractMetaText(node, author, content);
                         const rect = node.getBoundingClientRect();
                         collected.push({{
@@ -3424,6 +3371,9 @@ class XiaohongshuPublisher:
                             author,
                             content,
                             meta_text: metaText,
+                            owner_nickname: ownerNickname,
+                            is_owner_comment: isOwnerComment,
+                            already_replied_by_me: repliedByOwner,
                             is_reply: isReply,
                             rect_top: rect.top,
                             rect_left: rect.left,
@@ -3457,6 +3407,9 @@ class XiaohongshuPublisher:
             author = _normalize_comment_text(item.get("author"), limit=120)
             content = _normalize_comment_text(item.get("content"), limit=280)
             meta_text = _normalize_comment_text(item.get("meta_text"), limit=120)
+            owner_nickname = _normalize_comment_text(item.get("owner_nickname"), limit=120)
+            is_owner_comment = bool(item.get("is_owner_comment"))
+            already_replied_by_me = bool(item.get("already_replied_by_me"))
             is_reply = bool(item.get("is_reply"))
             if not content:
                 continue
@@ -3479,6 +3432,9 @@ class XiaohongshuPublisher:
                     "author": author,
                     "content": content,
                     "meta_text": meta_text,
+                    "owner_nickname": owner_nickname,
+                    "is_owner_comment": is_owner_comment,
+                    "already_replied_by_me": already_replied_by_me,
                     "text_preview": _normalize_comment_text(content, limit=120),
                     "is_reply": is_reply,
                 }
@@ -5549,6 +5505,20 @@ def _apply_comment_review_decisions(
             continue
         decision = decision_by_key[comment_key]
         action = decision.get("action")
+
+        if bool(item.get("already_replied_by_me")):
+            processed_keys.add(comment_key)
+            skipped_count += 1
+            applied_decisions.append(
+                {
+                    "comment_key": comment_key,
+                    "comment_id": item.get("comment_id", ""),
+                    "action": "skip",
+                    "success": True,
+                    "reason": "already_replied_by_me",
+                }
+            )
+            continue
 
         if action == "skip":
             processed_keys.add(comment_key)
